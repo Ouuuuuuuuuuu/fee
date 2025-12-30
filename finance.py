@@ -94,339 +94,183 @@ class DataManager:
         response = requests.put(url, headers=headers, data=json.dumps(data))
         return response.status_code in [200, 201]
 
-# --- 账单解析与去重类 ---
+# --- 智能账单解析类 (AI核心版) ---
 class BillParser:
     @staticmethod
-    def identify_and_parse(file):
-        """智能识别文件类型并解析"""
+    def identify_and_parse(file, api_key):
+        """智能识别文件类型并提取文本，交给AI解析"""
+        if not api_key:
+            return None, "请先配置 SILICONFLOW_API_KEY 以使用 AI 解析功能"
+
         filename = file.name.lower()
-        
-        if filename.endswith('.csv'):
-            return BillParser._parse_csv(file)
-        elif filename.endswith(('.xls', '.xlsx')):
-            return BillParser._parse_excel(file)
-        elif filename.endswith('.pdf'):
-            return BillParser._parse_pdf(file)
-        else:
-            return None, "不支持的文件格式，请上传 CSV, Excel 或 PDF"
-
-    @staticmethod
-    def _parse_csv(file):
-        """解析 CSV (适配微信/支付宝)"""
-        try:
-            content = file.getvalue().decode('utf-8')
-        except UnicodeDecodeError:
-            file.seek(0)
-            content = file.getvalue().decode('gbk', errors='ignore')
-
-        # --- 策略：先判断是哪种账单，再精准定位表头 ---
-        
-        # 1. 微信特征
-        if "微信支付账单明细" in content or "商户单号" in content:
-            return BillParser._parse_wechat_content(content)
-        
-        # 2. 支付宝特征
-        # 支付宝通常包含 "支付宝交易记录明细" 或者 列名包含 "商品说明" 和 "对方账号"
-        elif "支付宝" in content or "Partner Transaction ID" in content:
-            return BillParser._parse_alipay_content(content)
-             
-        # 默认尝试支付宝解析（容错）
-        return BillParser._parse_alipay_content(content)
-
-    @staticmethod
-    def _parse_excel(file):
-        """解析 Excel (招商银行等)"""
-        try:
-            df = pd.read_excel(file)
-        except Exception as e:
-            return None, f"Excel 读取失败: {e}"
-
-        cols = [str(c) for c in df.columns]
-        col_str = " ".join(cols)
-        
-        if "交易日期" in col_str and ("支出" in col_str or "交易金额" in col_str):
-            return BillParser._parse_cmb_dataframe(df)
-        
-        return None, "未识别的 Excel 账单格式。"
-
-    @staticmethod
-    def _parse_pdf(file):
-        """解析 PDF (招商银行)"""
-        try:
-            results = []
-            with pdfplumber.open(file) as pdf:
-                for page in pdf.pages:
-                    # 提取表格
-                    table = page.extract_table()
-                    if not table:
-                        continue
-                    
-                    # 寻找表头行 (招行PDF通常有 '记账日期' 或 'Date')
-                    header_idx = -1
-                    for i, row in enumerate(table):
-                        # 清洗 row 中的 None
-                        row_text = [str(cell).replace('\n', '') for cell in row if cell]
-                        row_str = "".join(row_text)
-                        if "记账日期" in row_str or "Date" in row_str and "Currency" in row_str:
-                            header_idx = i
-                            break
-                    
-                    if header_idx == -1:
-                        continue # 没找到表头，跳过此页
-
-                    # 确定列索引 (基于招行标准PDF格式)
-                    # 通常: 记账日期(0), 货币(1), 交易金额(2), 联机余额(3), 交易摘要(4), 对手信息(5)
-                    # 注意：有时候可能有额外空列，需要动态匹配
-                    headers = [str(h).replace('\n', '').strip() for h in table[header_idx] if h]
-                    
-                    # 开始解析数据
-                    for row in table[header_idx+1:]:
-                        # 过滤无效行 (例如下一页的表头或者是空的)
-                        if not row or len(row) < 3: continue
-                        
-                        # 简单映射：假设前几列固定
-                        # 清洗换行符
-                        clean_row = [str(cell).strip() if cell else "" for cell in row]
-                        
-                        # 日期列 (通常第1列)
-                        date_str = clean_row[0].replace('\n', '')
-                        if not re.match(r'\d{4}-\d{2}-\d{2}', date_str):
-                            continue # 不是日期，跳过
-
-                        # 金额列 (通常第3列)
-                        amt_str = clean_row[2].replace(',', '').replace('\n', '')
-                        try:
-                            amt = float(amt_str)
-                        except:
-                            continue
-
-                        final_type = "支出" if amt < 0 else "收入"
-                        final_amt = abs(amt)
-
-                        # 备注信息 (摘要 + 对手信息)
-                        # 摘要通常第5列，对手信息第6列 (索引4, 5)
-                        memo = ""
-                        if len(clean_row) > 4:
-                            memo += clean_row[4].replace('\n', ' ')
-                        if len(clean_row) > 5:
-                            memo += " " + clean_row[5].replace('\n', ' ')
-
-                        results.append({
-                            "日期": date_str,
-                            "类型": final_type,
-                            "金额": final_amt,
-                            "备注": memo.strip(),
-                            "分类": "招行PDF"
-                        })
-            
-            if not results:
-                return None, "PDF 解析成功但未提取到有效数据，请确认是招商银行流水。"
-                
-            return pd.DataFrame(results), None
-
-        except Exception as e:
-            return None, f"PDF 解析异常: {str(e)}"
-
-    @staticmethod
-    def _parse_wechat_content(content):
-        # 微信逻辑优化：寻找 "交易时间" 所在行作为 Header
-        lines = content.split('\n')
-        start_row = 0
-        found = False
-        for i, line in enumerate(lines):
-            # 微信表头特征：包含 '交易时间' 且包含 '当前状态'
-            if "交易时间" in line and "当前状态" in line:
-                start_row = i
-                found = True
-                break
-        
-        if not found:
-            return None, "未找到微信账单表头"
+        content_text = ""
+        source_type = "未知文件"
 
         try:
-            df = pd.read_csv(StringIO(content), header=start_row)
-        except:
-            return None, "微信CSV结构错误"
-
-        df.columns = [c.strip() for c in df.columns]
-        
-        # 筛选支付成功的
-        if '当前状态' in df.columns:
-            df = df[df['当前状态'] == '支付成功']
-        
-        results = []
-        for _, row in df.iterrows():
-            row_type = row.get('收/支', '')
-            if row_type == "/" or row_type == "不计收支": continue
-            
-            final_type = "支出" if row_type == "支出" else "收入"
-            # 处理金额：去 ¥ 符号
-            amt_str = str(row.get('金额(元)', 0)).replace('¥', '').replace(',', '')
-            try:
-                amt = float(amt_str)
-            except:
-                continue
-            
-            # 日期处理
-            try:
-                d_str = pd.to_datetime(row['交易时间']).strftime('%Y-%m-%d')
-            except:
-                continue
-
-            # 组合备注：商品 + 交易对方
-            item = str(row.get('商品', '')).strip()
-            partner = str(row.get('交易对方', '')).strip()
-            memo = f"{partner} - {item}" if partner else item
-
-            results.append({
-                "日期": d_str,
-                "类型": final_type,
-                "金额": amt,
-                "备注": memo.strip(),
-                "分类": "微信导入"
-            })
-        return pd.DataFrame(results), None
-
-    @staticmethod
-    def _parse_alipay_content(content):
-        # 支付宝逻辑优化
-        lines = content.split('\n')
-        start_row = 0
-        found = False
-        for i, line in enumerate(lines):
-            # 支付宝表头特征：包含 '交易时间' 且包含 '交易分类' (用户提供的样本特征)
-            # 或者包含 '交易时间' 和 '商品说明'
-            if "交易时间" in line and ("交易分类" in line or "商品说明" in line):
-                start_row = i
-                found = True
-                break
-        
-        if not found:
-            # 尝试暴力回退查找
-            # 有时候分隔线在表头上面
-            for i, line in enumerate(lines):
-                if "----------------" in line:
-                    start_row = i + 1
-                    found = True
-                    break
-        
-        if not found:
-             return None, "未找到支付宝账单表头"
-
-        try:
-            df = pd.read_csv(StringIO(content), header=start_row)
-        except:
-            return None, "支付宝CSV结构错误"
-
-        df.columns = [c.strip() for c in df.columns]
-        
-        # 状态过滤
-        if '交易状态' in df.columns:
-            df = df[df['交易状态'].isin(['交易成功', '支付成功', '已支出', '资金转移'])]
-
-        results = []
-        for _, row in df.iterrows():
-            # 过滤空金额
-            if pd.isna(row.get('金额')): continue
-            
-            row_type = str(row.get('收/支', '')).strip()
-            # 用户样本显示有 "不计收支"，通常我们不记这笔（因为可能是理财/转账），或者记为支出？
-            # 按照惯例，"不计收支" 往往是信用卡还款或理财，为了不重记，通常忽略，除非用户强行要
-            # 这里保持忽略逻辑
-            if row_type == "不计收支" or row_type == "": continue
-            
-            final_type = "支出" if row_type == "支出" else "收入"
-            try:
-                amt = float(str(row['金额']))
-            except:
-                continue
-            
-            try:
-                d_str = pd.to_datetime(row['交易时间']).strftime('%Y-%m-%d')
-            except:
-                continue
-            
-            partner = str(row.get('交易对方', '')).strip()
-            item_name = str(row.get('商品说明', '')).strip()
-            cat = str(row.get('交易分类', '支付宝导入')).strip()
-
-            results.append({
-                "日期": d_str,
-                "类型": final_type,
-                "金额": amt,
-                "备注": f"{partner} {item_name}".strip(),
-                "分类": cat
-            })
-        return pd.DataFrame(results), None
-
-    @staticmethod
-    def _parse_cmb_dataframe(df):
-        """招行 Excel DataFrame 解析"""
-        # 寻找 Header
-        header_row_idx = 0
-        for i in range(len(df)):
-            row_vals = [str(v) for v in df.iloc[i].values]
-            if "交易日期" in row_vals or "记账日期" in row_vals:
-                header_row_idx = i
-                break
-        
-        df.columns = df.iloc[header_row_idx]
-        df = df.iloc[header_row_idx+1:]
-        df.columns = [str(c).strip() for c in df.columns]
-        
-        results = []
-        for _, row in df.iterrows():
-            date_val = row.get('交易日期') or row.get('记账日期')
-            if pd.isna(date_val): continue
-            
-            try:
-                d_str = pd.to_datetime(str(date_val)).strftime('%Y-%m-%d')
-            except:
-                continue
-
-            # 金额处理
-            expense = row.get('支出', 0)
-            income = row.get('收入', 0)
-            trans_amt = row.get('交易金额', 0)
-
-            final_amt = 0.0
-            final_type = "支出"
-            
-            if trans_amt != 0 and not pd.isna(trans_amt):
-                # 招行可能是 "-22.00" 字符串
+            # 1. 提取文件内容为纯文本
+            if filename.endswith('.csv'):
+                source_type = "CSV账单"
                 try:
-                    t_val = float(str(trans_amt).replace(',', ''))
-                    final_amt = abs(t_val)
-                    final_type = "支出" if t_val < 0 else "收入"
-                except:
-                    pass
-            elif expense and float(str(expense).replace(',', '')) > 0:
-                final_amt = float(str(expense).replace(',', ''))
-                final_type = "支出"
-            elif income and float(str(income).replace(',', '')) > 0:
-                final_amt = float(str(income).replace(',', ''))
-                final_type = "收入"
+                    content_text = file.getvalue().decode('utf-8')
+                except UnicodeDecodeError:
+                    file.seek(0)
+                    content_text = file.getvalue().decode('gbk', errors='ignore')
             
-            if final_amt == 0: continue
+            elif filename.endswith(('.xls', '.xlsx')):
+                source_type = "Excel账单"
+                # 读取Excel所有sheet，转换为CSV字符串拼接
+                try:
+                    xls = pd.read_excel(file, sheet_name=None)
+                    text_parts = []
+                    for sheet_name, df in xls.items():
+                        # 将DataFrame转为CSV文本，保留上下文结构
+                        text_parts.append(f"--- Sheet: {sheet_name} ---\n")
+                        text_parts.append(df.to_csv(index=False))
+                    content_text = "\n".join(text_parts)
+                except Exception as e:
+                    return None, f"Excel 读取失败: {e}"
 
-            memo = str(row.get('交易备注') or row.get('交易摘要') or "") + " " + str(row.get('对手信息') or "")
+            elif filename.endswith('.pdf'):
+                source_type = "PDF账单"
+                try:
+                    text_parts = []
+                    with pdfplumber.open(file) as pdf:
+                        for page in pdf.pages:
+                            # 优先尝试提取表格
+                            tables = page.extract_tables()
+                            if tables:
+                                for table in tables:
+                                    # 将表格转为 CSV 格式文本
+                                    df_table = pd.DataFrame(table)
+                                    # 清理None
+                                    df_table = df_table.fillna("")
+                                    text_parts.append(df_table.to_csv(index=False, header=False))
+                            else:
+                                # 提取纯文本作为兜底
+                                text_parts.append(page.extract_text() or "")
+                    content_text = "\n".join(text_parts)
+                except Exception as e:
+                    return None, f"PDF 读取失败: {e}"
+            else:
+                return None, "不支持的文件格式"
+
+            # 2. 调用 AI 进行解析
+            if not content_text.strip():
+                return None, "文件内容为空或无法提取文本"
+                
+            return BillParser._call_ai_parser(content_text, source_type, api_key)
+
+        except Exception as e:
+            return None, f"解析过程发生未知错误: {str(e)}"
+
+    @staticmethod
+    def _call_ai_parser(content_text, source_type, api_key):
+        """调用 DeepSeek-V3.2 进行结构化提取"""
+        
+        # 截断保护：虽然 DeepSeek 上下文很长，但防止极端大文件，保留前 50000 字符通常足够包含一个月账单的关键信息
+        # 如果是CSV，通常头部是关键。如果是流水，最好能处理更多。
+        # 这里设置为 100k 字符，DeepSeek处理得过来。
+        truncated_content = content_text[:100000]
+        
+        system_prompt = """
+        你是一个专业的财务数据提取助手。你的任务是从杂乱的账单文本中提取交易流水。
+        请遵循以下规则：
+        1. 输出必须是标准的 JSON 数组格式 `[{"date": "...", ...}, ...]`。
+        2. 不要包含 markdown 标记（如 ```json）。
+        3. 字段说明：
+           - date: 交易日期，格式必须统一为 YYYY-MM-DD。如果年份缺失，默认2025年。
+           - type: "支出" 或 "收入"。根据金额正负或"收/支"列判断。通常银行账单中负数是支出，或者在"支出"列的数字。
+           - amount: 金额绝对值（数字类型，不要字符串）。
+           - merchant: 交易对象/商户名/摘要。
+           - category: 根据商户名推断分类（如：餐饮、交通、购物、转账、工资、理财、还款、其他）。
+        4. 过滤掉无效行（如表头、页码、统计汇总行、余额行）。只保留具体交易。
+        5. 对于"不计收支"或"资金转移"的条目，如果看起来像信用卡还款，标记为"转账"或"还款"，类型自定（通常不记入日常收支，但用户可能需要）。
+        6. 如果文本是乱码或无法识别为账单，返回空数组 []。
+        """
+
+        user_prompt = f"""
+        请处理这份 {source_type} 数据，提取所有交易记录。
+        
+        数据内容片段：
+        {truncated_content}
+        """
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "model": TEXT_MODEL_NAME, # 使用 deepseek-ai/DeepSeek-V3.2
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "max_tokens": 8192, # 尽可能输出完整
+            "temperature": 0.1  # 低温度保证准确性
+        }
+
+        try:
+            # 使用 SiliconFlow 兼容接口
+            response = requests.post(
+                "[https://api.siliconflow.cn/v1/chat/completions](https://api.siliconflow.cn/v1/chat/completions)",
+                headers=headers,
+                json=payload,
+                timeout=120 # 解析大文件需要更多时间
+            )
             
-            results.append({
-                "日期": d_str,
-                "类型": final_type,
-                "金额": final_amt,
-                "备注": memo.strip(),
-                "分类": "招行导入"
-            })
-            
-        return pd.DataFrame(results), None
+            if response.status_code == 200:
+                res_json = response.json()
+                ai_content = res_json['choices'][0]['message']['content']
+                
+                # 清洗 Markdown
+                ai_content = ai_content.replace("```json", "").replace("```", "").strip()
+                
+                try:
+                    data_list = json.loads(ai_content)
+                    if not isinstance(data_list, list):
+                        return None, "AI 返回格式错误（非数组）"
+                    
+                    if not data_list:
+                        return None, "AI 未能提取到任何有效交易记录"
+
+                    # 转为 DataFrame 并做基础清洗
+                    df = pd.DataFrame(data_list)
+                    
+                    # 确保列存在
+                    required_cols = ["date", "type", "amount", "merchant", "category"]
+                    for col in required_cols:
+                        if col not in df.columns:
+                            df[col] = ""
+                    
+                    # 映射回 app 统一的列名
+                    df = df.rename(columns={
+                        "date": "日期",
+                        "type": "类型",
+                        "amount": "金额",
+                        "merchant": "备注",
+                        "category": "分类"
+                    })
+                    
+                    # 数据类型转换
+                    df['金额'] = pd.to_numeric(df['金额'], errors='coerce').fillna(0)
+                    # 强制保留 AI 识别出的分类
+                    df['分类'] = df['分类'].fillna("AI导入")
+                    
+                    return df, None
+                    
+                except json.JSONDecodeError:
+                    return None, f"AI 返回了非 JSON 数据: {ai_content[:100]}..."
+            else:
+                return None, f"API 请求失败: {response.status_code} - {response.text}"
+                
+        except Exception as e:
+            return None, f"AI 请求异常: {str(e)}"
 
     @staticmethod
     def merge_and_deduplicate(old_df, new_df):
         """
         合并并去重
-        策略：如果 Date + Amount + Type 相同，视为重复。
-        强化：招行账单如果备注包含 '支付宝'/'微信'/'财付通' 且金额匹配，视为重复（即使 Old 数据里没有备注）。
         """
         if new_df is None or new_df.empty:
             return old_df, 0, 0
@@ -434,9 +278,6 @@ class BillParser:
         added_rows = []
         skipped_count = 0
         
-        # 建立索引：(日期, 金额) -> 存在的记录列表
-        # 使用 set 存储 key 加速判断
-        # Key 格式: "2023-01-01_100.50_支出"
         existing_keys = set()
         for _, row in old_df.iterrows():
             try:
@@ -453,39 +294,21 @@ class BillParser:
             except:
                 continue
             
-            is_duplicate = False
-            
-            # 1. 严格全匹配检查
+            # 简单去重逻辑：只要日期、金额、类型完全一致，就认为是重复
+            # AI 解析后，备注可能和原始 CSV 不一样，所以不作为去重主键，只作为辅助
             if key in existing_keys:
-                is_duplicate = True
-                
-            # 2. 招商银行特殊去重逻辑 (重叠账单)
-            # 如果这笔是招行的，且金额/日期已经在账本里了（大概率是支付宝/微信记过了），且招行备注里明确写了它是第三方支付
-            memo = str(row['备注'])
-            is_cmb = "招行" in str(row.get('分类', ''))
-            is_third_party_payment = any(k in memo for k in ["支付宝", "微信", "财付通", "Tenpay", "Alipay", "美团", "京东", "银联快捷"])
-            
-            if is_duplicate:
                 skipped_count += 1
                 continue
             
-            # 如果不是严格重复，但属于 [招行] + [第三方支付关键词] + [账本里已有同天同金额记录]
-            # 这种情况也要跳过，防止双重记账
-            # 注意：这里的逻辑假设“同天同金额”就是同一笔交易，对于小额高频交易（如一天买两次3块钱的水）可能会误杀，
-            # 但对于整理“御三家”流水来说，误杀概率低于重复记账的烦恼。
-            if is_cmb and is_third_party_payment and key in existing_keys:
-                 skipped_count += 1
-                 continue
-
             added_rows.append(row)
-            existing_keys.add(key) # 防止本批次内自我重复
+            existing_keys.add(key) 
 
         if not added_rows:
             return old_df, 0, skipped_count
             
         return pd.concat([old_df, pd.DataFrame(added_rows)], ignore_index=True), len(added_rows), skipped_count
 
-# --- AI 处理函数 ---
+# --- AI 处理函数 (图片 OCR) ---
 def process_bill_image(image_file, api_key):
     if not api_key:
         return None, "未配置 API Key"
@@ -525,12 +348,12 @@ def process_bill_image(image_file, api_key):
                 ]
             }
         ],
-        "max_tokens": 512
+        "max_tokens": 1024
     }
 
     try:
         response = requests.post(
-            "[https://api.siliconflow.cn/v1/chat/completions](https://api.siliconflow.cn/v1/chat/completions)",
+            "https://api.siliconflow.cn/v1/chat/completions",
             headers=headers,
             json=payload,
             timeout=45
@@ -597,13 +420,13 @@ def main():
     st.divider()
 
     # 4. 记账功能区 - 统一入口
-    tab_auto, tab_manual = st.tabs(["📤 智能导入 (多文件/图片)", "✍️ 手动记账"])
+    tab_auto, tab_manual = st.tabs(["📤 智能导入 (文件/图片)", "✍️ 手动记账"])
 
     with tab_auto:
         st.markdown("""
         <small>支持格式：
-        1. **图片** (jpg/png) -> AI 自动识别
-        2. **文件** (csv/xlsx/xls/pdf) -> 批量导入微信/支付宝/招行账单 (自动合并去重)
+        1. **图片** (jpg/png) -> 使用 Qwen-VL 视觉模型识别
+        2. **文件** (csv/xlsx/xls/pdf) -> 使用 DeepSeek-V3.2 文本模型智能分析 (支持所有银行/支付软件格式)
         </small>
         """, unsafe_allow_html=True)
         
@@ -616,60 +439,63 @@ def main():
         )
         
         if uploaded_files:
-            # 文件分类
             img_files = [f for f in uploaded_files if f.name.split('.')[-1].lower() in ['png', 'jpg', 'jpeg']]
             data_files = [f for f in uploaded_files if f.name.split('.')[-1].lower() in ['csv', 'xlsx', 'xls', 'pdf']]
 
             col_a, col_b = st.columns(2)
             
-            # --- 批量处理数据文件 ---
+            # --- 批量处理数据文件 (AI 文本解析) ---
             if data_files:
                 with col_a:
                     st.info(f"检测到 {len(data_files)} 个数据文件")
-                    if st.button(f"批量解析导入", key="btn_import_batch"):
-                        total_added = 0
-                        total_skipped = 0
-                        
-                        with st.spinner("正在批量解析..."):
-                            batch_df = pd.DataFrame()
+                    if st.button(f"AI 智能解析导入", key="btn_import_batch"):
+                        if not sf_api_key:
+                            st.error("请先配置 SILICONFLOW_API_KEY")
+                        else:
+                            total_added = 0
+                            total_skipped = 0
                             
-                            for f in data_files:
-                                df_new, err = BillParser.identify_and_parse(f)
-                                if err:
-                                    st.error(f"文件 {f.name} 解析失败: {err}")
-                                elif df_new is not None and not df_new.empty:
-                                    batch_df = pd.concat([batch_df, df_new], ignore_index=True)
-                            
-                            if not batch_df.empty:
-                                merged_df, added_count, skipped_count = BillParser.merge_and_deduplicate(
-                                    st.session_state.ledger_data, batch_df
-                                )
-                                total_added += added_count
-                                total_skipped += skipped_count
+                            with st.spinner("正在提取文本并呼叫 DeepSeek 进行分析 (可能需要几十秒)..."):
+                                batch_df = pd.DataFrame()
                                 
-                                if total_added > 0:
-                                    if dm.save_data(merged_df, st.session_state.get('github_sha')):
-                                        st.session_state.ledger_data = merged_df
-                                        st.session_state.github_sha = dm.load_data()[1]
-                                        st.success(f"🎉 批量导入完成！新增 {total_added} 条记录。")
-                                        if total_skipped > 0:
-                                            st.info(f"🛡️ 自动跳过了 {total_skipped} 条重复或重合记录")
-                                        st.rerun()
+                                for f in data_files:
+                                    # 注意：这里需要传入 api_key
+                                    df_new, err = BillParser.identify_and_parse(f, sf_api_key)
+                                    if err:
+                                        st.error(f"文件 {f.name} 解析失败: {err}")
+                                    elif df_new is not None and not df_new.empty:
+                                        batch_df = pd.concat([batch_df, df_new], ignore_index=True)
+                                
+                                if not batch_df.empty:
+                                    merged_df, added_count, skipped_count = BillParser.merge_and_deduplicate(
+                                        st.session_state.ledger_data, batch_df
+                                    )
+                                    total_added += added_count
+                                    total_skipped += skipped_count
+                                    
+                                    if total_added > 0:
+                                        if dm.save_data(merged_df, st.session_state.get('github_sha')):
+                                            st.session_state.ledger_data = merged_df
+                                            st.session_state.github_sha = dm.load_data()[1]
+                                            st.success(f"🎉 成功！DeepSeek 帮你提取了 {total_added} 条新记录。")
+                                            if total_skipped > 0:
+                                                st.info(f"🛡️ 自动跳过了 {total_skipped} 条重复记录")
+                                            st.rerun()
+                                        else:
+                                            st.error("保存失败")
                                     else:
-                                        st.error("保存失败")
+                                        st.warning(f"分析完成，但所有记录均已存在 (跳过 {total_skipped} 条)。")
                                 else:
-                                    st.warning(f"所有记录均已存在 (跳过 {total_skipped} 条)。")
-                            else:
-                                st.warning("没有解析出有效数据。")
+                                    st.warning("AI 没有发现有效的交易数据，可能是文件内容为空或格式过于特殊。")
 
-            # --- 批量/单张 图片处理 ---
+            # --- 批量/单张 图片处理 (OCR) ---
             if img_files:
                 with col_b:
                     st.info(f"检测到 {len(img_files)} 张图片")
                     if 'ocr_queue' not in st.session_state:
                         st.session_state.ocr_queue = []
                         
-                    if st.button(f"开始 AI 识别 ({len(img_files)}张)", key="btn_ocr_batch"):
+                    if st.button(f"开始 AI 视觉识别", key="btn_ocr_batch"):
                         if not sf_api_key:
                             st.error("请配置 SILICONFLOW_API_KEY")
                         else:
@@ -774,7 +600,7 @@ def main():
                         "messages": [{"role": "user", "content": f"分析这份账单，指出问题：\n{summary}"}]
                     }
                     try:
-                        r = requests.post("[https://api.siliconflow.cn/v1/chat/completions](https://api.siliconflow.cn/v1/chat/completions)", 
+                        r = requests.post("https://api.siliconflow.cn/v1/chat/completions", 
                                         headers={"Authorization": f"Bearer {sf_api_key}"}, json=payload)
                         st.markdown(r.json()['choices'][0]['message']['content'])
                     except Exception as e:
