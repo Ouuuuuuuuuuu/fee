@@ -14,7 +14,7 @@ import concurrent.futures
 import time
 
 # --- 页面配置 ---
-st.set_page_config(page_title="AI 智能账本 ", page_icon="💰", layout="wide")
+st.set_page_config(page_title="AI 账本 ", page_icon="💰", layout="wide")
 
 # --- 常量配置 ---
 DEFAULT_TARGET_SPEND = 60.0  # 每日体面支出标准
@@ -400,7 +400,7 @@ def main():
     st.sidebar.title("⚙️ 财务设置")
     
     # --- 调试模式开关 ---
-    st.session_state.debug_mode = st.sidebar.checkbox("🛠️ 开启性能调试模式", value=False)
+    st.session_state.debug_mode = st.sidebar.checkbox("🛠️ 开启调试模式", value=False)
     
     sf_api_key = st.secrets.get("SILICONFLOW_API_KEY", "")
     if not sf_api_key:
