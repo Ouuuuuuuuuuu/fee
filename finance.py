@@ -9,6 +9,7 @@ from io import StringIO, BytesIO
 import os
 import pdfplumber
 import re
+from openai import OpenAI
 
 # --- 页面配置 ---
 st.set_page_config(page_title="AI 智能账本", page_icon="💰", layout="wide")
@@ -17,7 +18,11 @@ st.set_page_config(page_title="AI 智能账本", page_icon="💰", layout="wide"
 DEFAULT_TARGET_SPEND = 60.0  # 每日体面支出标准
 GITHUB_API_URL = "https://api.github.com"
 VISION_MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct" 
-TEXT_MODEL_NAME = "deepseek-ai/DeepSeek-V3.2"
+TEXT_MODEL_NAME = "deepseek-ai/DeepSeek-V3" # SiliconFlow 目前主力是 V3，V3.2 如果上线可直接替换
+
+# --- 辅助函数：获取 LLM 客户端 ---
+def get_llm_client(api_key):
+    return OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1")
 
 # --- 存储类 ---
 class DataManager:
@@ -118,12 +123,10 @@ class BillParser:
             
             elif filename.endswith(('.xls', '.xlsx')):
                 source_type = "Excel账单"
-                # 读取Excel所有sheet，转换为CSV字符串拼接
                 try:
                     xls = pd.read_excel(file, sheet_name=None)
                     text_parts = []
                     for sheet_name, df in xls.items():
-                        # 将DataFrame转为CSV文本，保留上下文结构
                         text_parts.append(f"--- Sheet: {sheet_name} ---\n")
                         text_parts.append(df.to_csv(index=False))
                     content_text = "\n".join(text_parts)
@@ -136,17 +139,13 @@ class BillParser:
                     text_parts = []
                     with pdfplumber.open(file) as pdf:
                         for page in pdf.pages:
-                            # 优先尝试提取表格
                             tables = page.extract_tables()
                             if tables:
                                 for table in tables:
-                                    # 将表格转为 CSV 格式文本
                                     df_table = pd.DataFrame(table)
-                                    # 清理None
                                     df_table = df_table.fillna("")
                                     text_parts.append(df_table.to_csv(index=False, header=False))
                             else:
-                                # 提取纯文本作为兜底
                                 text_parts.append(page.extract_text() or "")
                     content_text = "\n".join(text_parts)
                 except Exception as e:
@@ -165,9 +164,8 @@ class BillParser:
 
     @staticmethod
     def _call_ai_parser(content_text, source_type, api_key):
-        """调用 DeepSeek-V3.2 进行结构化提取"""
+        """调用 DeepSeek 进行结构化提取 (OpenAI SDK版)"""
         
-        # 截断保护
         truncated_content = content_text[:100000]
         
         system_prompt = """
@@ -193,83 +191,60 @@ class BillParser:
         {truncated_content}
         """
 
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-
-        payload = {
-            "model": TEXT_MODEL_NAME, # 使用 deepseek-ai/DeepSeek-V3.2
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            "max_tokens": 8192, # 尽可能输出完整
-            "temperature": 0.1  # 低温度保证准确性
-        }
+        client = get_llm_client(api_key)
 
         try:
-            # 修正了这里的 URL 格式错误
-            response = requests.post(
-                "[https://api.siliconflow.cn/v1/chat/completions](https://api.siliconflow.cn/v1/chat/completions)",
-                headers=headers,
-                json=payload,
-                timeout=120
+            response = client.chat.completions.create(
+                model=TEXT_MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                max_tokens=8192,
+                temperature=0.1
             )
             
-            if response.status_code == 200:
-                res_json = response.json()
-                ai_content = res_json['choices'][0]['message']['content']
+            ai_content = response.choices[0].message.content
+            
+            # 清洗 Markdown
+            ai_content = ai_content.replace("```json", "").replace("```", "").strip()
+            
+            try:
+                data_list = json.loads(ai_content)
+                if not isinstance(data_list, list):
+                    return None, "AI 返回格式错误（非数组）"
                 
-                # 清洗 Markdown
-                ai_content = ai_content.replace("```json", "").replace("```", "").strip()
-                
-                try:
-                    data_list = json.loads(ai_content)
-                    if not isinstance(data_list, list):
-                        return None, "AI 返回格式错误（非数组）"
-                    
-                    if not data_list:
-                        return None, "AI 未能提取到任何有效交易记录"
+                if not data_list:
+                    return None, "AI 未能提取到任何有效交易记录"
 
-                    # 转为 DataFrame 并做基础清洗
-                    df = pd.DataFrame(data_list)
-                    
-                    # 确保列存在
-                    required_cols = ["date", "type", "amount", "merchant", "category"]
-                    for col in required_cols:
-                        if col not in df.columns:
-                            df[col] = ""
-                    
-                    # 映射回 app 统一的列名
-                    df = df.rename(columns={
-                        "date": "日期",
-                        "type": "类型",
-                        "amount": "金额",
-                        "merchant": "备注",
-                        "category": "分类"
-                    })
-                    
-                    # 数据类型转换
-                    df['金额'] = pd.to_numeric(df['金额'], errors='coerce').fillna(0)
-                    # 强制保留 AI 识别出的分类
-                    df['分类'] = df['分类'].fillna("AI导入")
-                    
-                    return df, None
-                    
-                except json.JSONDecodeError:
-                    return None, f"AI 返回了非 JSON 数据: {ai_content[:100]}..."
-            else:
-                return None, f"API 请求失败: {response.status_code} - {response.text}"
+                df = pd.DataFrame(data_list)
+                
+                required_cols = ["date", "type", "amount", "merchant", "category"]
+                for col in required_cols:
+                    if col not in df.columns:
+                        df[col] = ""
+                
+                df = df.rename(columns={
+                    "date": "日期",
+                    "type": "类型",
+                    "amount": "金额",
+                    "merchant": "备注",
+                    "category": "分类"
+                })
+                
+                df['金额'] = pd.to_numeric(df['金额'], errors='coerce').fillna(0)
+                df['分类'] = df['分类'].fillna("AI导入")
+                
+                return df, None
+                
+            except json.JSONDecodeError:
+                return None, f"AI 返回了非 JSON 数据: {ai_content[:100]}..."
                 
         except Exception as e:
             return None, f"AI 请求异常: {str(e)}"
 
     @staticmethod
     def merge_and_deduplicate(old_df, new_df):
-        """
-        合并并去重
-        """
         if new_df is None or new_df.empty:
             return old_df, 0, 0
 
@@ -304,18 +279,13 @@ class BillParser:
             
         return pd.concat([old_df, pd.DataFrame(added_rows)], ignore_index=True), len(added_rows), skipped_count
 
-# --- AI 处理函数 (图片 OCR) ---
+# --- AI 处理函数 (图片 OCR - OpenAI SDK版) ---
 def process_bill_image(image_file, api_key):
     if not api_key:
         return None, "未配置 API Key"
 
     image_bytes = image_file.getvalue()
     base64_image = base64.b64encode(image_bytes).decode('utf-8')
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
 
     prompt = """
     请识别这张账单图片。提取以下字段并以JSON格式返回：
@@ -328,39 +298,32 @@ def process_bill_image(image_file, api_key):
     直接返回JSON，不需要 ```json 标记。
     """
 
-    payload = {
-        "model": VISION_MODEL_NAME, 
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{base64_image}"
-                        }
-                    }
-                ]
-            }
-        ],
-        "max_tokens": 1024
-    }
+    client = get_llm_client(api_key)
 
     try:
-        response = requests.post(
-            "https://api.siliconflow.cn/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=45
+        response = client.chat.completions.create(
+            model=VISION_MODEL_NAME,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=1024
         )
-        if response.status_code == 200:
-            result = response.json()
-            content = result['choices'][0]['message']['content']
-            clean_content = content.replace("```json", "").replace("```", "").strip()
-            return json.loads(clean_content), None
-        else:
-            return None, f"API Error {response.status_code}: {response.text}"
+        
+        content = response.choices[0].message.content
+        clean_content = content.replace("```json", "").replace("```", "").strip()
+        return json.loads(clean_content), None
+
     except Exception as e:
         return None, f"请求异常: {str(e)}"
 
@@ -422,7 +385,7 @@ def main():
         st.markdown("""
         <small>支持格式：
         1. **图片** (jpg/png) -> 使用 Qwen-VL 视觉模型识别
-        2. **文件** (csv/xlsx/xls/pdf) -> 使用 DeepSeek-V3.2 文本模型智能分析 (支持所有银行/支付软件格式)
+        2. **文件** (csv/xlsx/xls/pdf) -> 使用 DeepSeek-V3 文本模型智能分析 (支持所有银行/支付软件格式)
         </small>
         """, unsafe_allow_html=True)
         
@@ -591,14 +554,17 @@ def main():
             if sf_api_key and not st.session_state.ledger_data.empty:
                 with st.spinner("AI 正在思考..."):
                     summary = st.session_state.ledger_data.to_string()
-                    payload = {
-                        "model": TEXT_MODEL_NAME, 
-                        "messages": [{"role": "user", "content": f"分析这份账单，指出问题：\n{summary}"}]
-                    }
+                    
+                    client = get_llm_client(sf_api_key)
+                    
                     try:
-                        r = requests.post("https://api.siliconflow.cn/v1/chat/completions", 
-                                        headers={"Authorization": f"Bearer {sf_api_key}"}, json=payload)
-                        st.markdown(r.json()['choices'][0]['message']['content'])
+                        response = client.chat.completions.create(
+                            model=TEXT_MODEL_NAME,
+                            messages=[
+                                {"role": "user", "content": f"分析这份账单，指出问题：\n{summary}"}
+                            ]
+                        )
+                        st.markdown(response.choices[0].message.content)
                     except Exception as e:
                         st.error(f"AI 服务异常: {e}")
 
