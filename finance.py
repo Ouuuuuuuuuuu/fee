@@ -26,18 +26,47 @@ TEXT_MODEL_NAME = "deepseek-ai/DeepSeek-V3.2"
 def get_llm_client(api_key):
     return OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1")
 
-# --- 工具函数：JSON 提取 ---
+# --- 工具函数：JSON 提取 (增强版) ---
 def extract_json_from_text(text):
     if not text: return None
     text = text.replace("```json", "").replace("```", "").strip()
+    
+    # 1. 尝试直接提取完整数组
+    match = re.search(r'\[.*\]', text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group())
+        except:
+            pass # 继续尝试修复
+
+    # 2. 尝试修复截断的 JSON (常见于长文本输出耗尽 Token)
+    # 如果以 [ 开头但没有 ] 结尾
+    if text.strip().startswith('[') and not text.strip().endswith(']'):
+        # 尝试找到最后一个完整的对象结束符 }
+        last_brace = text.rfind('}')
+        if last_brace != -1:
+            fixed_text = text[:last_brace+1] + ']'
+            try:
+                return json.loads(fixed_text)
+            except:
+                pass
+
+    # 3. 暴力提取所有 JSON 对象
+    # 如果数组结构坏了，尝试提取里面的 {...}, {...}
+    objects = []
+    for match in re.finditer(r'\{.*?\}', text, re.DOTALL):
+        try:
+            obj = json.loads(match.group())
+            if isinstance(obj, dict):
+                objects.append(obj)
+        except:
+            pass
+    
+    if objects:
+        return objects
+
+    # 4. 最后的手段：尝试直接解析
     try:
-        # 优先尝试提取数组
-        match = re.search(r'\[.*\]', text, re.DOTALL)
-        if match: return json.loads(match.group())
-        # 其次尝试对象
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match: return json.loads(match.group())
-        # 最后尝试直接解析
         return json.loads(text)
     except:
         return None
@@ -92,11 +121,13 @@ class DataManager:
         # 2. 强制转换金额为 float (处理空字符串、非数字字符)
         df['金额'] = pd.to_numeric(df['金额'], errors='coerce').fillna(0.0)
         
-        # 3. 强制转换日期为 datetime.date
-        # errors='coerce' 会将无法解析的日期变为 NaT (然后fillna填充为今天或特定日期)
-        df['日期'] = pd.to_datetime(df['日期'], errors='coerce').dt.date
-        # 填充无效日期为今天，避免编辑器报错
-        df['日期'] = df['日期'].fillna(date.today())
+        # 3. 强制转换日期 (修复 StreamlitAPIException)
+        # 先转换为 datetime64[ns]，处理无效值为 NaT
+        df['日期'] = pd.to_datetime(df['日期'], errors='coerce')
+        # 填充 NaT 为今天
+        df['日期'] = df['日期'].fillna(pd.Timestamp(date.today()))
+        # 最后转换为 python date 对象
+        df['日期'] = df['日期'].dt.date
 
         # 4. 字符串列处理 NaNs
         df['类型'] = df['类型'].astype(str).replace('nan', '支出')
@@ -219,8 +250,29 @@ class DataManager:
 # --- AI 解析器 ---
 class BillParser:
     @staticmethod
+    def split_text_into_chunks(text, chunk_size=15000):
+        """将长文本按行分割成小块，每块不超过 chunk_size 字符"""
+        lines = text.split('\n')
+        chunks = []
+        current_chunk = []
+        current_len = 0
+        
+        for line in lines:
+            if current_len + len(line) > chunk_size and current_chunk:
+                chunks.append("\n".join(current_chunk))
+                current_chunk = []
+                current_len = 0
+            current_chunk.append(line)
+            current_len += len(line) + 1 # +1 for newline
+            
+        if current_chunk:
+            chunks.append("\n".join(current_chunk))
+        
+        return chunks if chunks else [text]
+
+    @staticmethod
     def identify_and_parse(filename, file_bytes, api_key):
-        """处理文件内容 (纯函数，无 Streamlit 上下文依赖)"""
+        """处理文件内容 (包含自动分块处理逻辑)"""
         t_start = time.time()
         debug_log = {"file": filename, "steps": []}
         
@@ -259,29 +311,60 @@ class BillParser:
             if not content_text.strip():
                 return None, "内容为空", debug_log
 
-            # 2. AI 处理
-            t1 = time.time()
-            # 截断策略
-            if len(content_text) > 80000:
-                content_text = content_text[:80000] + "\n...(truncated)..."
+            # 2. 分块处理 (避免 AI 输出截断)
+            chunks = BillParser.split_text_into_chunks(content_text)
+            debug_log["chunks_count"] = len(chunks)
+            
+            all_dfs = []
+            
+            # 使用局部线程池处理分块
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as chunk_executor:
+                futures = {
+                    chunk_executor.submit(BillParser._call_ai_parser, chunk, source_type, api_key, i): i 
+                    for i, chunk in enumerate(chunks)
+                }
                 
-            prompt = f"""
-            你是一个严谨的财务数据提取专家。
-            任务：从文本中提取交易记录。
-            原则：宁缺毋假，禁止捏造。
-            
-            输入文本类型：{source_type}
-            当前年份参考：{datetime.datetime.now().year}
-            
-            输出要求：
-            1. 仅返回 JSON 数组。
-            2. 字段：date(YYYY-MM-DD), type(支出/收入), amount(数字), merchant(商户/备注), category(分类)。
-            3. 分类参考：[餐饮, 交通, 购物, 居住, 娱乐, 医疗, 工资, 理财, 其他]。
-            
-            文本内容：
-            {content_text}
-            """
-            
+                for future in concurrent.futures.as_completed(futures):
+                    chunk_idx = futures[future]
+                    df_chunk, _, log_chunk = future.result()
+                    
+                    if df_chunk is not None and not df_chunk.empty:
+                        all_dfs.append(df_chunk)
+                        debug_log["steps"].append(f"Chunk {chunk_idx}: 提取 {len(df_chunk)} 条")
+                    else:
+                        debug_log["steps"].append(f"Chunk {chunk_idx}: 无数据 ({log_chunk})")
+
+            if not all_dfs:
+                return None, "未提取到有效数据 (所有分块均失败)", debug_log
+                
+            final_df = pd.concat(all_dfs, ignore_index=True)
+            debug_log["total_time"] = time.time() - t_start
+            return final_df, None, debug_log
+
+        except Exception as e:
+            return None, str(e), debug_log
+
+    @staticmethod
+    def _call_ai_parser(content_text, source_type, api_key, chunk_idx=0):
+        """单独处理一个文本块"""
+        prompt = f"""
+        你是一个严谨的财务数据提取专家。
+        任务：从文本片段中提取交易记录。
+        原则：宁缺毋假，禁止捏造。不要自行补充日期年份，除非文本中有。
+        
+        输入文本类型：{source_type} (片段 {chunk_idx})
+        当前年份参考：{datetime.datetime.now().year}
+        
+        输出要求：
+        1. 仅返回 JSON 数组。
+        2. 字段：date(YYYY-MM-DD), type(支出/收入), amount(数字), merchant(商户/备注), category(分类)。
+        3. 分类参考：[餐饮, 交通, 购物, 居住, 娱乐, 医疗, 工资, 理财, 其他]。
+        
+        文本内容：
+        {content_text}
+        """
+        
+        try:
             client = get_llm_client(api_key)
             resp = client.chat.completions.create(
                 model=TEXT_MODEL_NAME,
@@ -289,16 +372,11 @@ class BillParser:
                 max_tokens=4096,
                 temperature=0.0
             )
-            debug_log["steps"].append(f"AI响应耗时: {time.time()-t1:.4f}s")
-            
-            # 3. 解析结果
-            t2 = time.time()
             raw_json = resp.choices[0].message.content
             data = extract_json_from_text(raw_json)
-            debug_log["steps"].append(f"JSON解析耗时: {time.time()-t2:.4f}s")
             
             if not data: 
-                return None, "未提取到有效数据", debug_log
+                return None, None, f"JSON解析失败: {raw_json[:50]}..."
                 
             df = pd.DataFrame(data)
             # 标准化
@@ -311,11 +389,10 @@ class BillParser:
             df['金额'] = pd.to_numeric(df['金额'], errors='coerce').fillna(0)
             df['日期'] = df['日期'].astype(str).apply(lambda x: x.split(' ')[0])
             
-            debug_log["total_time"] = time.time() - t_start
-            return df, None, debug_log
+            return df, None, "Success"
 
         except Exception as e:
-            return None, str(e), debug_log
+            return None, None, str(e)
 
     @staticmethod
     def process_image(filename, image_bytes, api_key):
@@ -399,7 +476,7 @@ def main():
     
     if dm.use_github:
         st.sidebar.success(f"已连接: {dm.repo}")
-        if st.sidebar.button("☁️ 强制同步云端"):
+        if st.sidebar.button("☁️ 强制同步云端", width="stretch"):
             with st.spinner("正在拉取最新数据..."):
                 df, sha = dm.load_data(force_refresh=True)
                 st.session_state.ledger_data = df
@@ -456,7 +533,7 @@ def main():
     # --- 智能导入 Tab ---
     with t_import:
         files = st.file_uploader("支持 PDF/CSV/Excel/图片", accept_multiple_files=True)
-        if files and st.button("🚀 批量开始识别", type="primary"):
+        if files and st.button("🚀 批量开始识别", type="primary", width="stretch"):
             if not api_key:
                 st.error("缺少 API Key")
                 st.stop()
@@ -516,7 +593,8 @@ def main():
                         st.error(f"❌ {fname} 异常: {e}")
                     
                     completed += 1
-                    progress.progress(completed / total_tasks)
+                    if total_tasks > 0:
+                        progress.progress(completed / total_tasks)
 
             # 3. 显示调试信息
             if st.session_state.debug_mode:
@@ -549,7 +627,7 @@ def main():
             cat = c4.selectbox("分类", ["餐饮", "交通", "购物", "居住", "娱乐", "医疗", "工资", "其他"])
             rem = c5.text_input("备注")
             
-            if st.form_submit_button("💾 保存", use_container_width=True):
+            if st.form_submit_button("💾 保存", width="stretch"):
                 row = pd.DataFrame([{"日期": str(d), "类型": t, "金额": a, "分类": cat, "备注": rem}])
                 merged, added = DataManager.merge_data(st.session_state.ledger_data, row)
                 ok, new_sha = dm.save_data(merged, st.session_state.get('github_sha'))
@@ -582,7 +660,7 @@ def main():
                 }
             )
             
-            if st.button("💾 保存表格变更"):
+            if st.button("💾 保存表格变更", width="stretch"):
                 if not edited_df.equals(st.session_state.ledger_data):
                     with st.spinner("同步中..."):
                         ok, new_sha = dm.save_data(edited_df, st.session_state.get('github_sha'))
@@ -626,7 +704,7 @@ def main():
             # AI 分析模块
             st.divider()
             st.subheader("🤖 AI 财务顾问")
-            if st.button("生成本月分析报告"):
+            if st.button("生成本月分析报告", width="stretch"):
                 if not api_key:
                     st.error("请配置 API Key")
                 else:
