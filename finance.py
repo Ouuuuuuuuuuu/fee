@@ -16,7 +16,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 # --- 页面配置 ---
-st.set_page_config(page_title="AI 智能账本 Pro (10号账期版)", page_icon="💰", layout="wide")
+st.set_page_config(page_title="AI 智能账本 Pro (AI分类版)", page_icon="💰", layout="wide")
 
 # --- 常量配置 ---
 GITHUB_API_URL = "https://api.github.com"
@@ -25,18 +25,12 @@ TEXT_MODEL_NAME = "deepseek-ai/DeepSeek-V3.2"
 CHUNK_SIZE = 12000 
 BILL_CYCLE_DAY = 10  # 账单日：每月10号
 
-# --- 标准分类定义 ---
-# 格式： "标准分类": ["关键词1", "关键词2", ...]
-CATEGORY_MAPPING = {
-    "餐饮美食": ["麦当劳", "肯德基", "饿了么", "美团", "星巴克", "瑞幸", "饭", "面", "吃", "饮", "烧烤", "火锅", "食品", "菜", "酒", "茶", "养生小食坊"],
-    "交通出行": ["滴滴", "打车", "地铁", "公交", "交通", "加油", "停车", "铁路", "车", "机票", "一卡通"],
-    "购物消费": ["超市", "便利店", "京东", "淘宝", "天猫", "拼多多", "商户消费", "扫二维码付款", "7-11", "全家"],
-    "生活服务": ["话费", "电费", "水费", "燃气", "宽带", "理发", "洗", "充值缴费"],
-    "娱乐休闲": ["电影", "游戏", "会员", "视频", "KTV", "网吧", "玩", "温泉", "龙悦酒店"],
-    "工资收入": ["工资", "薪", "奖金", "补助", "报销", "轧差"],
-    "转账红包": ["红包", "转账", "退款"],
-    "其他": []  # 兜底
-}
+# --- 核心定义：仅提供给AI做选择题，不再做关键词匹配 ---
+ALLOWED_CATEGORIES = [
+    "餐饮美食", "交通出行", "购物消费", "生活服务", 
+    "娱乐休闲", "医疗健康", "住房物业", "工资收入", 
+    "理财投资", "人情往来", "转账红包", "其他"
+]
 
 # --- 核心工具：OpenAI Client ---
 def get_llm_client(api_key):
@@ -45,7 +39,6 @@ def get_llm_client(api_key):
 # --- 辅助逻辑：计算账期范围 ---
 def get_fiscal_range(current_date, cycle_day=BILL_CYCLE_DAY):
     """
-    根据给定的日期和账单日，计算所属的账期范围。
     逻辑：如果今天 >= 10号，则账期是 本月10号 到 下月9号
           如果今天 < 10号，则账期是 上月10号 到 本月9号
     """
@@ -70,28 +63,6 @@ def get_fiscal_range(current_date, cycle_day=BILL_CYCLE_DAY):
         end_date = date(current_date.year, current_date.month, cycle_day) - datetime.timedelta(days=1)
     
     return start_date, end_date
-
-# --- 辅助逻辑：自动分类 ---
-def auto_categorize(row):
-    """基于备注和原始分类，自动归类到标准分类"""
-    # 如果已经是标准分类，直接返回
-    if row['分类'] in CATEGORY_MAPPING.keys():
-        return row['分类']
-
-    # 组合搜索文本：备注 + 原始分类
-    text = f"{str(row['备注'])} {str(row['分类'])}".lower()
-    
-    # 优先匹配具体关键词
-    for category, keywords in CATEGORY_MAPPING.items():
-        for kw in keywords:
-            if kw.lower() in text:
-                return category
-    
-    # 默认逻辑
-    if row['类型'] == '收入':
-        return "其他收入"
-    
-    return "其他" # 无法识别归为其他
 
 # --- 工具函数：JSON 提取与修复 ---
 def repair_truncated_json(json_str):
@@ -164,9 +135,8 @@ class DataManager:
     def merge_data(old_df, new_df):
         if new_df is None or new_df.empty: return old_df, 0
         
-        # 1. 应用自动分类清洗
-        new_df['分类'] = new_df.apply(auto_categorize, axis=1)
-
+        # 这里不再调用 auto_categorize，完全信任 AI 的判断
+        
         def get_fp(d): return d['日期'].astype(str) + d['金额'].astype(str) + d['备注'].str[:5]
         if old_df.empty: return new_df, len(new_df)
         old_fp = set(get_fp(old_df))
@@ -188,7 +158,6 @@ class DataManager:
         df['日期'] = df['日期'].fillna(pd.Timestamp(date.today()))
         df['日期'] = df['日期'].dt.date
         df['类型'] = df['类型'].astype(str).replace('nan', '支出')
-        # 如果读取时分类为空或不标准，也可以在这里再洗一次，但一般在merge时做
         df['分类'] = df['分类'].astype(str).replace('nan', '其他')
         df['备注'] = df['备注'].astype(str).replace('nan', '')
         return df
@@ -272,15 +241,19 @@ class BillParser:
     @staticmethod
     def _call_llm_for_text(text_chunk, api_key):
         client = get_llm_client(api_key)
+        # --- 核心：在 Prompt 中直接约束分类，不再使用 Python 关键词匹配 ---
         prompt = f"""
-        你是一个严谨的财务专家。
-        任务：从文本提取交易。
-        标准分类：{list(CATEGORY_MAPPING.keys())}。
-        要求：
-        1. 仅提取含日期、金额的行。
-        2. 根据备注或商户名，**必须**将分类映射到上述标准分类之一。
-        3. 返回纯JSON数组: [{{"date":"YYYY-MM-DD","type":"支出/收入","amount":数字,"merchant":"备注","category":"标准分类"}}]
-        文本：{text_chunk}
+        你是一个专业的财务数据提取助手。
+        任务：从文本中识别交易记录。
+        
+        **强制要求**：
+        1. 仅提取包含具体日期、金额的有效交易。
+        2. "category" 字段必须根据商户和备注进行**智能推断**，并**严格**从以下列表中选择一项（不要创造新分类）：
+           {ALLOWED_CATEGORIES}
+        3. 格式必须为纯JSON数组：[{{"date":"YYYY-MM-DD","type":"支出/收入","amount":数字,"merchant":"商户名或备注","category":"上述分类之一"}}]
+        
+        待处理文本：
+        {text_chunk}
         """
         try:
             resp = client.chat.completions.create(
@@ -334,12 +307,13 @@ class BillParser:
         try:
             b64_img = base64.b64encode(image_bytes).decode('utf-8')
             client = get_llm_client(api_key)
+            # --- 核心：视觉模型 Prompt 更新 ---
             resp = client.chat.completions.create(
                 model=VISION_MODEL_NAME,
                 messages=[{
                     "role": "user", 
                     "content": [
-                        {"type": "text", "text": f"提取账单。请归类为：{list(CATEGORY_MAPPING.keys())}。返回JSON数组。"},
+                        {"type": "text", "text": f"提取账单。'category'字段必须从以下列表中智能选择：{ALLOWED_CATEGORIES}。返回JSON数组：[{{date, type, amount, merchant, category}}]"},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
                     ]
                 }],
@@ -382,7 +356,7 @@ def main():
         st.session_state.github_sha = sha
 
     # --- 标题与账期选择 ---
-    st.title("💰 AI 智能账本 Pro")
+    st.title("💰 AI 智能账本 Pro (10号账期版)")
     
     # 默认账期：今天所属的账期
     default_start, default_end = get_fiscal_range(date.today())
@@ -434,7 +408,7 @@ def main():
     t_import, t_add, t_history, t_stats = st.tabs(["📥 智能导入", "✍️ 手动记账", "📋 历史明细", "📊 可视化报表"])
 
     with t_import:
-        st.info("💡 导入时会自动根据备注关键词（如'麦当劳'->'餐饮美食'）进行标准化归类。")
+        st.info(f"💡 AI 将自动把账单归类为：{', '.join(ALLOWED_CATEGORIES)}")
         files = st.file_uploader("上传文件 (PDF/CSV/Excel/图片)", accept_multiple_files=True)
         if files and st.button("🚀 开始识别", type="primary"):
             if not api_key: st.error("请配置 API Key"); st.stop()
@@ -480,7 +454,7 @@ def main():
             t = c2.selectbox("类型", ["支出", "收入"])
             a = c3.number_input("金额", min_value=0.01)
             c4, c5 = st.columns([1,2])
-            cat = c4.selectbox("分类", list(CATEGORY_MAPPING.keys()) + ["其他"])
+            cat = c4.selectbox("分类", ALLOWED_CATEGORIES)
             rem = c5.text_input("备注")
             if st.form_submit_button("保存", width="stretch"):
                 row = pd.DataFrame([{"日期":str(d),"类型":t,"金额":a,"分类":cat,"备注":rem}])
@@ -495,7 +469,7 @@ def main():
         if st.session_state.ledger_data.empty: st.info("无数据")
         else:
             edited = st.data_editor(st.session_state.ledger_data, use_container_width=True, num_rows="dynamic",
-                                    column_config={"分类": st.column_config.SelectboxColumn(options=list(CATEGORY_MAPPING.keys()) + ["其他"])})
+                                    column_config={"分类": st.column_config.SelectboxColumn(options=ALLOWED_CATEGORIES)})
             if st.button("保存表格"):
                 ok, sha = dm.save_data(edited, st.session_state.get('github_sha'))
                 if ok:
@@ -532,7 +506,6 @@ def main():
 
             st.divider()
             st.subheader("📈 资产净值趋势 (全周期)")
-            # 净值趋势使用全量数据，因为看净值通常需要看长期的
             if not df.empty:
                 df_sorted = df.sort_values('dt')
                 df_sorted['net'] = df_sorted.apply(lambda x: x['金额'] if x['类型']=='收入' else -x['金额'], axis=1)
@@ -541,7 +514,7 @@ def main():
                 
                 fig_area = px.area(daily_net, x='dt', y='asset', line_shape='spline')
                 fig_area.update_layout(xaxis_title="", yaxis_title="净资产", showlegend=False)
-                # 修复后的代码：使用 fillcolor 而不是 fill_color
+                # 修复了 fill_color -> fillcolor 的问题
                 fig_area.update_traces(line_color="#2E86C1", fillcolor="rgba(46, 134, 193, 0.2)")
                 st.plotly_chart(fig_area, use_container_width=True)
 
