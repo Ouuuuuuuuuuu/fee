@@ -5,4 +5,3 @@ openpyxl
 xlrd
 pymupdf
 openai
-fitz
