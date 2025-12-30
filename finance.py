@@ -1,111 +1,623 @@
 import streamlit as st
+import pandas as pd
+import datetime
+from datetime import date
+import requests
+import json
+import base64
+from io import StringIO, BytesIO
 import os
-import sys
-import subprocess
-import time
+import fitz  # PyMuPDF
+import re
+from openai import OpenAI, APITimeoutError
+import concurrent.futures
 
-# --- 核心修复：启动时自动创建必要目录 ---
-# Git 不会上传空文件夹，导致云端运行时因找不到目录报错 (RuntimeError: Directory does not exist)。
-# 这段代码会在应用启动瞬间自动创建它们，无需你在仓库里手动操作。
-REQUIRED_DIRS = ['temp', 'static', 'assets']
-for dir_name in REQUIRED_DIRS:
-    if not os.path.exists(dir_name):
-        try:
-            os.makedirs(dir_name)
-            print(f"已自动创建目录: {dir_name}") # 打印日志方便调试
-        except Exception as e:
-            print(f"创建目录 {dir_name} 失败: {e}")
+# --- 页面配置 ---
+st.set_page_config(page_title="AI 智能账本", page_icon="💰", layout="wide")
 
-# --- 依赖库检查 ---
-# 既然 requirements.txt 已包含 pymupdf，这里作为最后的“保底”措施
-try:
-    import fitz  # PyMuPDF
-except ImportError:
-    st.warning("检测到 PyMuPDF 未安装，正在尝试自动修复...")
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "pymupdf"])
-        import fitz
-        st.success("PyMuPDF 已自动安装！请刷新页面。")
-    except Exception as e:
-        st.error(f"无法安装 PyMuPDF。请确保 requirements.txt 中包含 'pymupdf'。\n错误: {e}")
-        st.stop()
+# --- 常量配置 ---
+DEFAULT_TARGET_SPEND = 60.0  # 每日体面支出标准
+GITHUB_API_URL = "https://api.github.com"
+VISION_MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct" 
+TEXT_MODEL_NAME = "deepseek-ai/DeepSeek-V3" # SiliconFlow 目前主力是 V3
 
-# --- 应用主逻辑 ---
+# --- 辅助函数：获取 LLM 客户端 ---
+def get_llm_client(api_key):
+    return OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1")
 
-st.set_page_config(page_title="财务文档分析器", layout="wide")
+# --- 存储类 ---
+class DataManager:
+    """数据管理类，支持 GitHub 远程存储和本地 CSV 存储"""
+    def __init__(self, github_token=None, repo=None, filename="ledger.csv"):
+        self.github_token = github_token
+        if repo and repo.startswith("http"):
+            self.repo = repo.rstrip("/").split("github.com/")[-1]
+        else:
+            self.repo = repo
+        self.filename = filename
+        self.use_github = bool(github_token and self.repo)
 
-st.title("💰 财务文档分析工具")
+    def load_data(self):
+        if self.use_github:
+            return self._load_from_github()
+        else:
+            return self._load_from_local()
 
-# 说明区域
-with st.expander("ℹ️ 关于此应用", expanded=False):
-    st.write("此应用用于解析财务 PDF 报表。如果遇到目录错误，系统已尝试自动修复。")
+    def save_data(self, df, sha=None):
+        if self.use_github:
+            return self._save_to_github(df, sha)
+        else:
+            return self._save_to_local(df)
 
-uploaded_file = st.file_uploader("请上传财务报表 (PDF)", type=["pdf"])
-
-if uploaded_file:
-    # 确保文件名安全，防止路径问题
-    safe_filename = "".join([c for c in uploaded_file.name if c.isalpha() or c.isdigit() or c in (' ', '.', '_')]).strip()
-    temp_path = os.path.join("temp", safe_filename)
-    
-    # 保存文件
-    try:
-        with open(temp_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-        
-        st.success(f"✅ 文件已上传: {uploaded_file.name}")
-        
-        # 开始解析
-        try:
-            doc = fitz.open(temp_path)
-            
-            # 布局：左侧信息，右侧预览
-            col1, col2 = st.columns([1, 2])
-            
-            with col1:
-                st.info("📄 文档概览")
-                st.write(f"**总页数:** {doc.page_count}")
-                st.markdown("**元数据:**")
-                st.json(doc.metadata)
-
-            with col2:
-                st.subheader("👀 内容预览 (第1页)")
-                if doc.page_count > 0:
-                    page = doc.load_page(0)
-                    
-                    # 文本预览
-                    text = page.get_text()
-                    st.text_area("提取的文本内容", text, height=300)
-                    
-                    # 图片预览
-                    st.markdown("**页面截图:**")
-                    pix = page.get_pixmap()
-                    st.image(pix.tobytes(), caption=f"第 1 页 / 共 {doc.page_count} 页", use_container_width=True)
-            
-            doc.close()
-            
-        except Exception as e:
-            st.error(f"❌ 解析 PDF 时发生错误: {e}")
-            
-    except Exception as e:
-        st.error(f"❌ 保存文件失败: {e}")
-        
-    finally:
-        # 清理逻辑：处理完后删除临时文件，保持环境整洁
-        if os.path.exists(temp_path):
+    def _load_from_local(self):
+        if os.path.exists(self.filename):
             try:
-                os.remove(temp_path)
+                return pd.read_csv(self.filename), None
             except:
-                pass # 如果删除失败也没关系，那是系统临时文件
+                return pd.DataFrame(columns=["日期", "类型", "金额", "备注", "分类"]), None
+        return pd.DataFrame(columns=["日期", "类型", "金额", "备注", "分类"]), None
 
-else:
-    # 空状态提示
-    st.markdown("""
-    <div style="text-align: center; color: gray; padding: 50px;">
-        <h3>👋 欢迎使用</h3>
-        <p>请在上方上传 PDF 文件开始分析</p>
-    </div>
-    """, unsafe_allow_html=True)
+    def _save_to_local(self, df):
+        df.to_csv(self.filename, index=False)
+        return True
 
-# 页脚
-st.markdown("---")
-st.caption("Environment: Streamlit Cloud | Engine: PyMuPDF")
+    def _load_from_github(self):
+        headers = {
+            "Authorization": f"token {self.github_token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        url = f"{GITHUB_API_URL}/repos/{self.repo}/contents/{self.filename}"
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code == 200:
+            content = response.json()
+            csv_str = base64.b64decode(content['content']).decode('utf-8')
+            try:
+                return pd.read_csv(StringIO(csv_str)), content['sha']
+            except pd.errors.EmptyDataError:
+                return pd.DataFrame(columns=["日期", "类型", "金额", "备注", "分类"]), content['sha']
+        elif response.status_code == 404:
+            return pd.DataFrame(columns=["日期", "类型", "金额", "备注", "分类"]), None
+        else:
+            st.error(f"GitHub 读取错误: {response.status_code}")
+            return pd.DataFrame(columns=["日期", "类型", "金额", "备注", "分类"]), None
+
+    def _save_to_github(self, df, sha):
+        headers = {
+            "Authorization": f"token {self.github_token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        csv_str = df.to_csv(index=False)
+        content_bytes = base64.b64encode(csv_str.encode('utf-8')).decode('utf-8')
+        
+        url = f"{GITHUB_API_URL}/repos/{self.repo}/contents/{self.filename}"
+        data = {
+            "message": f"Update ledger {datetime.datetime.now()}",
+            "content": content_bytes
+        }
+        if sha:
+            data["sha"] = sha
+        response = requests.put(url, headers=headers, data=json.dumps(data))
+        return response.status_code in [200, 201]
+
+# --- 智能账单解析类 (AI核心版) ---
+class BillParser:
+    @staticmethod
+    def identify_and_parse(file, api_key, status_container=None):
+        """智能识别文件类型并提取文本，交给AI解析"""
+        if not api_key:
+            return None, "请先配置 SILICONFLOW_API_KEY 以使用 AI 解析功能"
+
+        filename = file.name.lower()
+        content_text = ""
+        source_type = "未知文件"
+        
+        if status_container:
+            status_container.write(f"正在读取文件: {filename}...")
+
+        try:
+            # 1. 提取文件内容为纯文本
+            if filename.endswith('.csv'):
+                source_type = "CSV账单"
+                try:
+                    content_text = file.getvalue().decode('utf-8')
+                except UnicodeDecodeError:
+                    file.seek(0)
+                    content_text = file.getvalue().decode('gbk', errors='ignore')
+            
+            elif filename.endswith(('.xls', '.xlsx')):
+                source_type = "Excel账单"
+                try:
+                    xls = pd.read_excel(file, sheet_name=None)
+                    text_parts = []
+                    for sheet_name, df in xls.items():
+                        text_parts.append(f"--- Sheet: {sheet_name} ---\n")
+                        text_parts.append(df.to_csv(index=False))
+                    content_text = "\n".join(text_parts)
+                except Exception as e:
+                    return None, f"Excel 读取失败: {e}"
+
+            elif filename.endswith('.pdf'):
+                source_type = "PDF账单"
+                try:
+                    # 使用 PyMuPDF (fitz) 进行高速读取
+                    with fitz.open(stream=file.read(), filetype="pdf") as doc:
+                        text_parts = []
+                        for page in doc:
+                            text_parts.append(page.get_text())
+                        content_text = "\n".join(text_parts)
+                except Exception as e:
+                    return None, f"PDF 读取失败: {e}"
+            else:
+                return None, "不支持的文件格式"
+
+            # 2. 调用 AI 进行解析
+            if not content_text.strip():
+                return None, "文件内容为空或无法提取文本"
+            
+            if status_container:
+                status_container.write(f"文本提取完成 ({len(content_text)} 字符)，正在呼叫 DeepSeek 分析...")
+                
+            return BillParser._call_ai_parser(content_text, source_type, api_key)
+
+        except Exception as e:
+            return None, f"解析过程发生未知错误: {str(e)}"
+
+    @staticmethod
+    def _call_ai_parser(content_text, source_type, api_key):
+        """调用 DeepSeek 进行结构化提取 (OpenAI SDK版)"""
+        
+        system_prompt = """
+        你是一个专业的财务数据提取助手。你的任务是从杂乱的账单文本中提取交易流水。
+        请遵循以下规则：
+        1. 输出必须是标准的 JSON 数组格式 `[{"date": "...", ...}, ...]`。
+        2. 不要包含 markdown 标记（如 ```json）。
+        3. 字段说明：
+           - date: 交易日期，格式必须统一为 YYYY-MM-DD。如果年份缺失，默认2025年。
+           - type: "支出" 或 "收入"。根据金额正负或"收/支"列判断。通常银行账单中负数是支出，或者在"支出"列的数字。
+           - amount: 金额绝对值（数字类型，不要字符串）。
+           - merchant: 交易对象/商户名/摘要。
+           - category: 根据商户名推断分类（如：餐饮、交通、购物、转账、工资、理财、还款、其他）。
+        4. 过滤掉无效行（如表头、页码、统计汇总行、余额行）。只保留具体交易。
+        5. 对于"不计收支"或"资金转移"的条目，如果看起来像信用卡还款，标记为"转账"或"还款"，类型自定（通常不记入日常收支，但用户可能需要）。
+        6. 如果文本是乱码或无法识别为账单，返回空数组 []。
+        """
+
+        user_prompt = f"""
+        请处理这份 {source_type} 数据，提取所有交易记录。
+        
+        数据内容片段：
+        {content_text}
+        """
+
+        client = get_llm_client(api_key)
+
+        try:
+            # 移除 timeout 设置，允许模型长时间思考处理大文件
+            response = client.chat.completions.create(
+                model=TEXT_MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                max_tokens=8192,
+                temperature=0.1
+                # timeout=None # 默认不设置即为无限制（或受限于网络层默认值）
+            )
+            
+            ai_content = response.choices[0].message.content
+            
+            # --- 强力 JSON 提取与修复逻辑 ---
+            clean_content = ai_content.replace("```json", "").replace("```", "").strip()
+            
+            data_list = []
+            try:
+                data_list = json.loads(clean_content)
+            except json.JSONDecodeError:
+                start = clean_content.find('[')
+                end = clean_content.rfind(']')
+                
+                if start != -1 and end != -1 and end > start:
+                    json_str = clean_content[start:end+1]
+                    try:
+                        data_list = json.loads(json_str)
+                    except json.JSONDecodeError:
+                        last_obj_end = json_str.rfind('}')
+                        if last_obj_end != -1:
+                            fixed_json_str = json_str[:last_obj_end+1] + ']'
+                            try:
+                                data_list = json.loads(fixed_json_str)
+                            except:
+                                return None, f"JSON 修复失败。AI 响应片段: {clean_content[:500]}..."
+                        else:
+                             return None, f"无法提取有效 JSON。AI 响应片段: {clean_content[:500]}..."
+                else:
+                    return None, f"未找到 JSON 数组结构。AI 响应片段: {clean_content[:500]}..."
+
+            if not isinstance(data_list, list):
+                return None, "AI 返回格式错误（非数组）"
+            
+            if not data_list:
+                return None, "AI 未能提取到任何有效交易记录"
+
+            df = pd.DataFrame(data_list)
+            
+            required_cols = ["date", "type", "amount", "merchant", "category"]
+            for col in required_cols:
+                if col not in df.columns:
+                    df[col] = ""
+            
+            df = df.rename(columns={
+                "date": "日期",
+                "type": "类型",
+                "amount": "金额",
+                "merchant": "备注",
+                "category": "分类"
+            })
+            
+            df['金额'] = pd.to_numeric(df['金额'], errors='coerce').fillna(0)
+            df['分类'] = df['分类'].fillna("AI导入")
+            
+            return df, None
+        
+        except APITimeoutError:
+            return None, "AI 请求超时。建议检查网络或分批上传文件。"
+        except Exception as e:
+            return None, f"AI 请求异常: {str(e)}"
+
+    @staticmethod
+    def merge_and_deduplicate(old_df, new_df):
+        if new_df is None or new_df.empty:
+            return old_df, 0, 0
+
+        added_rows = []
+        skipped_count = 0
+        
+        existing_keys = set()
+        for _, row in old_df.iterrows():
+            try:
+                amt = float(row['金额'])
+                key = f"{row['日期']}_{amt:.2f}_{row['类型']}"
+                existing_keys.add(key)
+            except:
+                continue
+
+        for _, row in new_df.iterrows():
+            try:
+                amt = float(row['金额'])
+                key = f"{row['日期']}_{amt:.2f}_{row['类型']}"
+            except:
+                continue
+            
+            if key in existing_keys:
+                skipped_count += 1
+                continue
+            
+            added_rows.append(row)
+            existing_keys.add(key) 
+
+        if not added_rows:
+            return old_df, 0, skipped_count
+            
+        return pd.concat([old_df, pd.DataFrame(added_rows)], ignore_index=True), len(added_rows), skipped_count
+
+# --- AI 处理函数 (图片 OCR - OpenAI SDK版) ---
+def process_bill_image(image_file, api_key):
+    if not api_key:
+        return None, "未配置 API Key"
+
+    image_bytes = image_file.getvalue()
+    base64_image = base64.b64encode(image_bytes).decode('utf-8')
+
+    prompt = """
+    请识别这张账单图片。提取以下字段并以JSON格式返回：
+    1. date (格式YYYY-MM-DD)
+    2. amount (数字类型，不要带货币符号)
+    3. merchant (商户名或交易说明)
+    4. category (从以下选择最接近的: 餐饮, 交通, 购物, 居住, 娱乐, 工资, 其他)
+    5. type (支出 或 收入)
+    
+    直接返回JSON，不需要 ```json 标记。
+    """
+
+    client = get_llm_client(api_key)
+
+    try:
+        response = client.chat.completions.create(
+            model=VISION_MODEL_NAME,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=1024
+        )
+        
+        content = response.choices[0].message.content
+        
+        # 鲁棒性提取
+        clean_content = content.replace("```json", "").replace("```", "").strip()
+        start = clean_content.find('{')
+        end = clean_content.rfind('}')
+        if start != -1 and end != -1:
+            clean_content = clean_content[start:end+1]
+            
+        return json.loads(clean_content), None
+
+    except Exception as e:
+        return None, f"请求异常: {str(e)}"
+
+# --- 主程序 ---
+def main():
+    # 1. 配置加载
+    st.sidebar.title("⚙️ 个人财务设置")
+    
+    sf_api_key = st.secrets.get("SILICONFLOW_API_KEY", "")
+    github_token = st.secrets.get("GITHUB_TOKEN", "")
+    github_repo = st.secrets.get("GITHUB_REPO", "")
+
+    dm = DataManager(github_token, github_repo)
+    
+    if dm.use_github:
+        st.sidebar.success(f"☁️ 数据存储: GitHub ({github_repo})")
+    else:
+        st.sidebar.warning("📂 数据存储: 本地模式")
+
+    payday = st.sidebar.number_input("每月发薪日", 1, 31, 10)
+    current_cash = st.sidebar.number_input("当前现金/余额", value=3000.0)
+
+    # 2. 加载数据
+    if 'ledger_data' not in st.session_state:
+        df, sha = dm.load_data()
+        st.session_state.ledger_data = df
+        st.session_state.github_sha = sha
+
+    # 3. 财务概览
+    st.title("💰 极简账本")
+    
+    today = date.today()
+    if today.day >= payday:
+        next_pay_date = date(today.year + (1 if today.month == 12 else 0), 1 if today.month == 12 else today.month + 1, payday)
+    else:
+        next_pay_date = date(today.year, today.month, payday)
+    
+    days_left = (next_pay_date - today).days
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric("当前余额", f"¥{current_cash:,.2f}")
+    col2.metric("距离发工资", f"{days_left} 天")
+    
+    if days_left > 0:
+        daily_budget = current_cash / days_left
+        gap = daily_budget - DEFAULT_TARGET_SPEND
+        col3.metric("每日可用", f"¥{daily_budget:.1f}", 
+                    f"{gap:+.1f} (vs ¥{DEFAULT_TARGET_SPEND})",
+                    delta_color="normal" if gap >= 0 else "inverse")
+    else:
+        col3.metric("每日可用", "N/A", "今日发薪！")
+
+    st.divider()
+
+    # 4. 记账功能区 - 统一入口
+    tab_auto, tab_manual = st.tabs(["📤 智能导入 (文件/图片)", "✍️ 手动记账"])
+
+    with tab_auto:
+        st.markdown("""
+        <small>支持格式：
+        1. **图片** (jpg/png) -> 使用 Qwen-VL 视觉模型识别
+        2. **文件** (csv/xlsx/xls/pdf) -> 使用 DeepSeek-V3 文本模型智能分析 (支持所有银行/支付软件格式)
+        </small>
+        """, unsafe_allow_html=True)
+        
+        # 允许上传多个文件
+        uploaded_files = st.file_uploader(
+            "点击上传 (支持多选)", 
+            type=['png', 'jpg', 'jpeg', 'csv', 'xlsx', 'xls', 'pdf'], 
+            key="unified_upload",
+            accept_multiple_files=True
+        )
+        
+        if uploaded_files:
+            img_files = [f for f in uploaded_files if f.name.split('.')[-1].lower() in ['png', 'jpg', 'jpeg']]
+            data_files = [f for f in uploaded_files if f.name.split('.')[-1].lower() in ['csv', 'xlsx', 'xls', 'pdf']]
+
+            col_a, col_b = st.columns(2)
+            
+            # --- 批量处理数据文件 (并发 AI 解析) ---
+            if data_files:
+                with col_a:
+                    st.info(f"检测到 {len(data_files)} 个数据文件")
+                    if st.button(f"AI 智能解析导入", key="btn_import_batch"):
+                        if not sf_api_key:
+                            st.error("请先配置 SILICONFLOW_API_KEY")
+                        else:
+                            total_added = 0
+                            total_skipped = 0
+                            
+                            with st.status("正在并发分析所有文件...", expanded=True) as status:
+                                batch_df = pd.DataFrame()
+                                
+                                # 优化：增加线程数到 10
+                                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                                    # 提交任务
+                                    future_to_file = {
+                                        executor.submit(BillParser.identify_and_parse, f, sf_api_key, None): f 
+                                        for f in data_files
+                                    }
+                                    
+                                    for future in concurrent.futures.as_completed(future_to_file):
+                                        f = future_to_file[future]
+                                        try:
+                                            df_new, err = future.result()
+                                            if err:
+                                                status.write(f"❌ {f.name}: {err}")
+                                            elif df_new is not None and not df_new.empty:
+                                                status.write(f"✅ {f.name}: 提取成功 ({len(df_new)} 条)")
+                                                batch_df = pd.concat([batch_df, df_new], ignore_index=True)
+                                            else:
+                                                status.write(f"⚠️ {f.name}: 未提取到数据")
+                                        except Exception as exc:
+                                            status.write(f"❌ {f.name}: 处理异常 {exc}")
+
+                                if not batch_df.empty:
+                                    status.write("正在合并数据并去重...")
+                                    merged_df, added_count, skipped_count = BillParser.merge_and_deduplicate(
+                                        st.session_state.ledger_data, batch_df
+                                    )
+                                    total_added += added_count
+                                    total_skipped += skipped_count
+                                    
+                                    if total_added > 0:
+                                        if dm.save_data(merged_df, st.session_state.get('github_sha')):
+                                            st.session_state.ledger_data = merged_df
+                                            st.session_state.github_sha = dm.load_data()[1]
+                                            status.update(label="处理完成！", state="complete", expanded=False)
+                                            st.success(f"🎉 成功导入 {total_added} 条新记录！(自动跳过 {total_skipped} 条重复)")
+                                            st.rerun()
+                                        else:
+                                            status.update(label="保存失败", state="error")
+                                            st.error("保存失败")
+                                    else:
+                                        status.update(label="处理完成 - 无新增数据", state="complete")
+                                        st.warning(f"所有记录均已存在 (跳过 {total_skipped} 条)。")
+                                else:
+                                    status.update(label="处理完成 - 无有效数据", state="error")
+                                    st.warning("AI 没有发现有效的交易数据，可能是文件内容为空或格式过于特殊。")
+
+            # --- 批量/单张 图片处理 (OCR) ---
+            if img_files:
+                with col_b:
+                    st.info(f"检测到 {len(img_files)} 张图片")
+                    if 'ocr_queue' not in st.session_state:
+                        st.session_state.ocr_queue = []
+                        
+                    if st.button(f"开始 AI 视觉识别", key="btn_ocr_batch"):
+                        if not sf_api_key:
+                            st.error("请配置 SILICONFLOW_API_KEY")
+                        else:
+                            # 图片识别通常很快，暂不使用并发，以免 UI 过于复杂，且 Qwen-VL 并发限流可能更严
+                            with st.status("正在进行视觉识别...", expanded=True) as status:
+                                for img_f in img_files:
+                                    status.write(f"正在识别: {img_f.name}...")
+                                    data, err = process_bill_image(img_f, sf_api_key)
+                                    if not err and data:
+                                        data['_filename'] = img_f.name
+                                        st.session_state.ocr_queue.append(data)
+                                        status.write(f"✅ {img_f.name}: 识别成功")
+                                    else:
+                                        status.write(f"❌ {img_f.name}: {err}")
+                                status.update(label="识别完成，请在下方确认", state="complete")
+                            st.rerun()
+
+        # --- OCR 结果确认队列 ---
+        if 'ocr_queue' in st.session_state and len(st.session_state.ocr_queue) > 0:
+            st.divider()
+            st.subheader(f"🔍 待确认 OCR 结果 (剩余 {len(st.session_state.ocr_queue)} 个)")
+            
+            current_ocr = st.session_state.ocr_queue[0]
+            
+            with st.container(border=True):
+                st.caption(f"来源文件: {current_ocr.get('_filename', 'Unknown')}")
+                with st.form("ocr_confirm_queue"):
+                    c1, c2 = st.columns(2)
+                    o_date = c1.date_input("日期", pd.to_datetime(current_ocr.get('date', str(date.today()))))
+                    o_type = c2.selectbox("类型", ["支出", "收入"], index=1 if current_ocr.get('type') == '收入' else 0)
+                    o_amt = c1.number_input("金额", float(current_ocr.get('amount', 0)))
+                    o_cat = c2.text_input("分类", current_ocr.get('category', '餐饮'))
+                    o_desc = st.text_input("备注", current_ocr.get('merchant', ''))
+                    
+                    col_submit, col_skip = st.columns([1, 1])
+                    if col_submit.form_submit_button("✅ 确认添加"):
+                        new_row = {"日期": str(o_date), "类型": o_type, "金额": o_amt, "备注": o_desc, "分类": o_cat}
+                        st.session_state.ledger_data = pd.concat([st.session_state.ledger_data, pd.DataFrame([new_row])], ignore_index=True)
+                        dm.save_data(st.session_state.ledger_data, st.session_state.get('github_sha'))
+                        st.session_state.github_sha = dm.load_data()[1]
+                        st.session_state.ocr_queue.pop(0)
+                        st.rerun()
+                        
+                    if col_skip.form_submit_button("🗑️ 跳过此条"):
+                        st.session_state.ocr_queue.pop(0)
+                        st.rerun()
+
+    # --- Manual Tab ---
+    with tab_manual:
+        with st.form("manual_form"):
+            c_m1, c_m2 = st.columns(2)
+            m_date = c_m1.date_input("日期", date.today())
+            m_type = c_m2.selectbox("类型", ["支出", "收入"])
+            m_amt = c_m1.number_input("金额", step=1.0)
+            m_cat = c_m2.selectbox("分类", ["餐饮", "交通", "购物", "居住", "娱乐", "工资", "其他"])
+            m_desc = st.text_input("备注")
+            
+            if st.form_submit_button("💾 保存记录"):
+                new_row = {"日期": str(m_date), "类型": m_type, "金额": m_amt, "备注": m_desc, "分类": m_cat}
+                st.session_state.ledger_data = pd.concat([st.session_state.ledger_data, pd.DataFrame([new_row])], ignore_index=True)
+                dm.save_data(st.session_state.ledger_data, st.session_state.get('github_sha'))
+                st.session_state.github_sha = dm.load_data()[1]
+                st.rerun()
+
+    st.divider()
+
+    # 5. 历史账单 & 可视化
+    if not st.session_state.ledger_data.empty:
+        st.subheader("📊 历史账单")
+        edited_df = st.data_editor(
+            st.session_state.ledger_data,
+            num_rows="dynamic",
+            use_container_width=True,
+            key="history_editor"
+        )
+        if st.button("🔄 同步表格修改"):
+            if dm.save_data(edited_df, st.session_state.get('github_sha')):
+                st.session_state.ledger_data = edited_df
+                st.session_state.github_sha = dm.load_data()[1]
+                st.success("同步成功")
+                st.rerun()
+        
+        st.subheader("📈 消费透视")
+        chart_df = st.session_state.ledger_data.copy()
+        chart_df['金额'] = pd.to_numeric(chart_df['金额'], errors='coerce').fillna(0)
+        chart_df['日期'] = pd.to_datetime(chart_df['日期']).dt.date
+        expense_df = chart_df[chart_df['类型'] == '支出']
+        
+        if not expense_df.empty:
+            t1, t2 = st.tabs(["📊 分类占比", "📉 每日趋势"])
+            with t1:
+                st.bar_chart(expense_df.groupby('分类')['金额'].sum().sort_values(ascending=False), color="#FF4B4B")
+            with t2:
+                st.line_chart(expense_df.groupby('日期')['金额'].sum())
+    else:
+        st.info("暂无数据")
+
+    # 6. AI 分析
+    with st.expander("🤖 AI 财务分析"):
+        if st.button("分析我的开销"):
+            if sf_api_key and not st.session_state.ledger_data.empty:
+                with st.spinner("AI 正在思考..."):
+                    summary = st.session_state.ledger_data.to_string()
+                    
+                    client = get_llm_client(sf_api_key)
+                    
+                    try:
+                        response = client.chat.completions.create(
+                            model=TEXT_MODEL_NAME,
+                            messages=[
+                                {"role": "user", "content": f"分析这份账单，指出问题：\n{summary}"}
+                            ],
+                            timeout=60
+                        )
+                        st.markdown(response.choices[0].message.content)
+                    except Exception as e:
+                        st.error(f"AI 服务异常: {e}")
+
+if __name__ == "__main__":
+    main()
