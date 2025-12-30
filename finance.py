@@ -14,7 +14,7 @@ import concurrent.futures
 import time
 
 # --- 页面配置 ---
-st.set_page_config(page_title="AI 智能账本 Pro", page_icon="💰", layout="wide")
+st.set_page_config(page_title="AI 智能账本 ", page_icon="💰", layout="wide")
 
 # --- 常量配置 ---
 DEFAULT_TARGET_SPEND = 60.0  # 每日体面支出标准
