@@ -9,7 +9,7 @@ from io import StringIO, BytesIO
 import os
 import fitz  # PyMuPDF
 import re
-from openai import OpenAI, APITimeoutError
+from openai import OpenAI
 import concurrent.futures
 import time
 
@@ -110,7 +110,7 @@ def extract_json_from_text(text):
     
     return None, f"JSON提取失败，可能截断严重。预览: {original_preview}..."
 
-# --- 数据管理类 (保持不变) ---
+# --- 数据管理类 (已修复：merge_data 移入此类) ---
 class DataManager:
     def __init__(self, github_token=None, repo=None, filename="ledger.csv"):
         self.github_token = github_token
@@ -141,6 +141,30 @@ class DataManager:
             return success, new_sha
         else:
             return self._save_to_local(save_df), None
+
+    @staticmethod
+    def merge_data(old_df, new_df):
+        """合并数据并去重"""
+        if new_df is None or new_df.empty: return old_df, 0
+        
+        # 简单指纹生成
+        def get_fp(d): 
+            return d['日期'].astype(str) + d['金额'].astype(str) + d['备注'].str[:5]
+            
+        if old_df.empty: return new_df, len(new_df)
+        
+        old_fp = set(get_fp(old_df))
+        new_df['_fp'] = get_fp(new_df)
+        
+        # 找出新数据
+        to_add = new_df[~new_df['_fp'].isin(old_fp)].drop(columns=['_fp'])
+        
+        if to_add.empty: return old_df, 0
+        
+        merged = pd.concat([old_df, to_add], ignore_index=True)
+        merged = DataManager._clean_df_types(merged)
+        merged = merged.sort_values('日期', ascending=False).reset_index(drop=True)
+        return merged, len(to_add)
 
     @staticmethod
     def _clean_df_types(df):
@@ -425,21 +449,6 @@ class BillParser:
         except Exception as e:
             return None, str(e), debug_log
 
-    @staticmethod
-    def merge_data(old_df, new_df):
-        if new_df is None or new_df.empty: return old_df, 0
-        def get_fp(d): 
-            return d['日期'].astype(str) + d['金额'].astype(str) + d['备注'].str[:5]
-        if old_df.empty: return new_df, len(new_df)
-        old_fp = set(get_fp(old_df))
-        new_df['_fp'] = get_fp(new_df)
-        to_add = new_df[~new_df['_fp'].isin(old_fp)].drop(columns=['_fp'])
-        if to_add.empty: return old_df, 0
-        merged = pd.concat([old_df, to_add], ignore_index=True)
-        merged = DataManager._clean_df_types(merged)
-        merged = merged.sort_values('日期', ascending=False).reset_index(drop=True)
-        return merged, len(to_add)
-
 # --- 主程序 ---
 def main():
     if 'debug_mode' not in st.session_state: st.session_state.debug_mode = False
@@ -526,10 +535,6 @@ def main():
             total_tasks = len(tasks_doc) + len(tasks_img)
             completed = 0
 
-            # 仅在文件级别并发 (每个文件内部如果太大还会开启自己的线程池)
-            # 为了避免线程爆炸，这里我们可以让文件级别串行，文件内并行，或者反过来
-            # 这里选择：文件级别用 ProcessPoolExecutor 太重，维持原样，但在内部控制并发
-            
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                 futures = {}
                 for t in tasks_doc:
@@ -560,7 +565,8 @@ def main():
                     st.json(debug_logs)
 
             if not new_df.empty:
-                merged_df, added = BillParser.merge_data(st.session_state.ledger_data, new_df)
+                # 修复点：merge_data 现在已经位于 DataManager 中，可以正确调用了
+                merged_df, added = DataManager.merge_data(st.session_state.ledger_data, new_df)
                 if added > 0:
                     with st.spinner("正在保存至云端..."):
                         ok, new_sha = dm.save_data(merged_df, st.session_state.get('github_sha'))
@@ -584,7 +590,8 @@ def main():
             rem = c5.text_input("备注")
             if st.form_submit_button("💾 保存", width="stretch"):
                 row = pd.DataFrame([{"日期": str(d), "类型": t, "金额": a, "分类": cat, "备注": rem}])
-                merged, added = BillParser.merge_data(st.session_state.ledger_data, row)
+                # 修复点：手动记账也使用 DataManager.merge_data
+                merged, added = DataManager.merge_data(st.session_state.ledger_data, row)
                 ok, new_sha = dm.save_data(merged, st.session_state.get('github_sha'))
                 if ok:
                     st.session_state.ledger_data = merged
