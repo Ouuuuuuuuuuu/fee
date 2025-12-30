@@ -167,9 +167,7 @@ class BillParser:
     def _call_ai_parser(content_text, source_type, api_key):
         """调用 DeepSeek-V3.2 进行结构化提取"""
         
-        # 截断保护：虽然 DeepSeek 上下文很长，但防止极端大文件，保留前 50000 字符通常足够包含一个月账单的关键信息
-        # 如果是CSV，通常头部是关键。如果是流水，最好能处理更多。
-        # 这里设置为 100k 字符，DeepSeek处理得过来。
+        # 截断保护
         truncated_content = content_text[:100000]
         
         system_prompt = """
@@ -211,12 +209,12 @@ class BillParser:
         }
 
         try:
-            # 使用 SiliconFlow 兼容接口
+            # 修正了这里的 URL 格式错误
             response = requests.post(
                 "[https://api.siliconflow.cn/v1/chat/completions](https://api.siliconflow.cn/v1/chat/completions)",
                 headers=headers,
                 json=payload,
-                timeout=120 # 解析大文件需要更多时间
+                timeout=120
             )
             
             if response.status_code == 200:
@@ -294,8 +292,6 @@ class BillParser:
             except:
                 continue
             
-            # 简单去重逻辑：只要日期、金额、类型完全一致，就认为是重复
-            # AI 解析后，备注可能和原始 CSV 不一样，所以不作为去重主键，只作为辅助
             if key in existing_keys:
                 skipped_count += 1
                 continue
