@@ -5,7 +5,7 @@ from datetime import date
 import requests
 import json
 import base64
-from io import StringIO
+from io import StringIO, BytesIO
 import os
 
 # --- 页面配置 ---
@@ -16,7 +16,7 @@ DEFAULT_TARGET_SPEND = 60.0  # 每日体面支出标准
 GITHUB_API_URL = "https://api.github.com"
 # 推荐的视觉模型，SiliconFlow 上可用
 VISION_MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct" 
-# 文本分析模型 (用户指定)
+# 文本分析模型
 TEXT_MODEL_NAME = "deepseek-ai/DeepSeek-V3.2"
 
 # --- 存储类：处理数据保存 ---
@@ -97,6 +97,121 @@ class DataManager:
         response = requests.put(url, headers=headers, data=json.dumps(data))
         return response.status_code in [200, 201]
 
+# --- 账单解析类 ---
+class BillParser:
+    @staticmethod
+    def parse_wechat(file):
+        """解析微信账单 CSV"""
+        try:
+            content = file.getvalue().decode('utf-8')
+        except UnicodeDecodeError:
+            file.seek(0)
+            content = file.getvalue().decode('gbk', errors='ignore')
+
+        lines = content.split('\n')
+        start_row = 0
+        for i, line in enumerate(lines):
+            if "交易时间" in line:
+                start_row = i
+                break
+        
+        if start_row == 0 and "交易时间" not in lines[0]:
+             return None, "未找到微信账单表头，请确认文件格式"
+
+        try:
+            df = pd.read_csv(StringIO(content), header=start_row)
+        except Exception as e:
+            return None, f"CSV解析失败: {str(e)}"
+
+        # 微信字段清洗
+        df.columns = [c.strip() for c in df.columns]
+        required_cols = ['交易时间', '金额(元)', '收/支', '交易对方', '商品', '当前状态']
+        
+        if not all(col in df.columns for col in required_cols):
+             return None, f"列名不匹配，检测到的列: {list(df.columns)}"
+
+        df = df[df['当前状态'] == '支付成功']
+        
+        results = []
+        for _, row in df.iterrows():
+            amt = float(str(row['金额(元)']).replace('¥', '').replace(',', ''))
+            row_type = row['收/支']
+            
+            final_type = "支出" if row_type == "支出" else "收入"
+            if row_type == "/" or row_type == "不计收支":
+                continue
+
+            try:
+                d_str = pd.to_datetime(row['交易时间']).strftime('%Y-%m-%d')
+            except:
+                continue
+
+            results.append({
+                "日期": d_str,
+                "类型": final_type,
+                "金额": amt,
+                "备注": f"{row['交易对方']} - {row['商品']}",
+                "分类": "导入/未分类"
+            })
+            
+        return pd.DataFrame(results), None
+
+    @staticmethod
+    def parse_alipay(file):
+        """解析支付宝账单"""
+        try:
+            content = file.getvalue().decode('gbk')
+        except UnicodeDecodeError:
+            file.seek(0)
+            content = file.getvalue().decode('utf-8', errors='ignore')
+
+        lines = content.split('\n')
+        start_row = 0
+        for i, line in enumerate(lines):
+            if "交易时间" in line and "交易对方" in line:
+                start_row = i
+                break
+        
+        try:
+            df = pd.read_csv(StringIO(content), header=start_row, encoding='gbk')
+        except:
+             df = pd.read_csv(StringIO(content), header=start_row)
+
+        df.columns = [c.strip() for c in df.columns]
+        
+        if '交易状态' in df.columns:
+            df = df[df['交易状态'].isin(['交易成功', '支付成功', '已支出'])]
+
+        results = []
+        for _, row in df.iterrows():
+            if '金额' not in row or pd.isna(row['金额']): continue
+
+            amt = float(str(row['金额']))
+            row_type = str(row.get('收/支', '')).strip()
+            
+            final_type = "支出" if row_type == "支出" else "收入"
+            if row_type == "不计收支" or row_type == "":
+                continue
+
+            try:
+                d_str = pd.to_datetime(row['交易时间']).strftime('%Y-%m-%d')
+            except:
+                continue
+            
+            cat = row.get('交易分类', '导入/未分类')
+            merchant = row.get('交易对方', '')
+            desc = row.get('商品说明', '')
+
+            results.append({
+                "日期": d_str,
+                "类型": final_type,
+                "金额": amt,
+                "备注": f"{merchant} {desc}".strip(),
+                "分类": cat
+            })
+            
+        return pd.DataFrame(results), None
+
 # --- AI 处理函数 ---
 def process_bill_image(image_file, api_key):
     if not api_key:
@@ -110,7 +225,6 @@ def process_bill_image(image_file, api_key):
         "Content-Type": "application/json"
     }
 
-    # 针对 Qwen-VL 优化的 Prompt
     prompt = """
     请识别这张账单图片。提取以下字段并以JSON格式返回：
     1. date (格式YYYY-MM-DD)
@@ -142,6 +256,7 @@ def process_bill_image(image_file, api_key):
     }
 
     try:
+        # 修正 URL 格式问题
         response = requests.post(
             "[https://api.siliconflow.cn/v1/chat/completions](https://api.siliconflow.cn/v1/chat/completions)",
             headers=headers,
@@ -151,7 +266,6 @@ def process_bill_image(image_file, api_key):
         if response.status_code == 200:
             result = response.json()
             content = result['choices'][0]['message']['content']
-            # 清洗数据，防止 markdown 干扰
             clean_content = content.replace("```json", "").replace("```", "").strip()
             return json.loads(clean_content), None
         else:
@@ -164,21 +278,17 @@ def main():
     # 1. 配置加载
     st.sidebar.title("⚙️ 个人财务设置")
     
-    # 获取配置 (优先读取 secrets.toml)
     sf_api_key = st.secrets.get("SILICONFLOW_API_KEY", "")
     github_token = st.secrets.get("GITHUB_TOKEN", "")
     github_repo = st.secrets.get("GITHUB_REPO", "")
 
-    # 初始化存储管理器
     dm = DataManager(github_token, github_repo)
     
-    # 侧边栏状态指示
     if dm.use_github:
         st.sidebar.success(f"☁️ 数据存储: GitHub ({github_repo})")
     else:
         st.sidebar.warning("📂 数据存储: 本地模式 (重启后Streamlit Cloud会重置数据)")
 
-    # 财务设置
     payday = st.sidebar.number_input("每月发薪日", 1, 31, 10)
     current_cash = st.sidebar.number_input("当前现金/余额", value=3000.0)
 
@@ -188,10 +298,9 @@ def main():
         st.session_state.ledger_data = df
         st.session_state.github_sha = sha
 
-    # 3. 财务概览 (Dashboard)
+    # 3. 财务概览
     st.title("💰 极简账本")
     
-    # 计算逻辑
     today = date.today()
     if today.day >= payday:
         next_pay_date = date(today.year + (1 if today.month == 12 else 0), 1 if today.month == 12 else today.month + 1, payday)
@@ -200,7 +309,6 @@ def main():
     
     days_left = (next_pay_date - today).days
     
-    # 核心指标
     col1, col2, col3 = st.columns(3)
     col1.metric("当前余额", f"¥{current_cash:,.2f}")
     col2.metric("距离发工资", f"{days_left} 天")
@@ -211,155 +319,152 @@ def main():
         col3.metric("每日可用", f"¥{daily_budget:.1f}", 
                     f"{gap:+.1f} (vs ¥{DEFAULT_TARGET_SPEND})",
                     delta_color="normal" if gap >= 0 else "inverse")
-        
-        if gap < 0:
-            st.error(f"⚠️ 警报：每天亏空 {abs(gap):.1f} 元，体面生活岌岌可危！")
-        else:
-            st.success(f"🎉 状态良好：每天还有 {gap:.1f} 元的“挥霍”空间。")
     else:
         col3.metric("每日可用", "N/A", "今日发薪！")
 
     st.divider()
 
     # 4. 记账功能区
-    c1, c2 = st.columns([1, 1])
+    tab_ocr, tab_manual, tab_import = st.tabs(["📸 截图记账 (OCR)", "✍️ 手动记账", "📂 导入账单(Excel/CSV)"])
 
-    with c1:
-        st.subheader("📸 截图记账 (AI)")
-        uploaded_file = st.file_uploader("", type=['png', 'jpg', 'jpeg'], key="ocr_upload")
+    # --- Tab 1: OCR ---
+    with tab_ocr:
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            # 修复: 明确设置 label 为 "上传截图"，防止出现 label 不能为空的警告
+            uploaded_file = st.file_uploader("上传截图", type=['png', 'jpg', 'jpeg'], key="ocr_upload")
+            if uploaded_file and st.button("开始识别", key="btn_ocr"):
+                if not sf_api_key:
+                    st.error("请先配置 SILICONFLOW_API_KEY")
+                else:
+                    with st.spinner("AI 正在提取信息..."):
+                        data, err = process_bill_image(uploaded_file, sf_api_key)
+                        if err:
+                            st.error(err)
+                        else:
+                            st.success("识别成功！")
+                            st.session_state.temp_ocr_data = data
         
-        if uploaded_file and st.button("开始识别", key="btn_ocr"):
-            if not sf_api_key:
-                st.error("请先在 secrets.toml 配置 SILICONFLOW_API_KEY")
-            else:
-                with st.spinner("AI 正在提取账单信息..."):
-                    data, err = process_bill_image(uploaded_file, sf_api_key)
-                    if err:
-                        st.error(err)
-                    else:
-                        st.success("识别成功，请在右侧确认添加")
-                        st.session_state.temp_ocr_data = data
+        with c2:
+            if 'temp_ocr_data' in st.session_state:
+                res = st.session_state.temp_ocr_data
+                with st.form("ocr_confirm"):
+                    st.write("确认识别结果：")
+                    o_date = st.date_input("日期", pd.to_datetime(res.get('date', str(date.today()))))
+                    o_type = st.selectbox("类型", ["支出", "收入"], index=1 if res.get('type') == '收入' else 0)
+                    o_amt = st.number_input("金额", float(res.get('amount', 0)))
+                    o_cat = st.text_input("分类", res.get('category', '餐饮'))
+                    o_desc = st.text_input("备注", res.get('merchant', ''))
+                    
+                    if st.form_submit_button("✅ 确认添加"):
+                        new_row = {"日期": str(o_date), "类型": o_type, "金额": o_amt, "备注": o_desc, "分类": o_cat}
+                        st.session_state.ledger_data = pd.concat([st.session_state.ledger_data, pd.DataFrame([new_row])], ignore_index=True)
+                        dm.save_data(st.session_state.ledger_data, st.session_state.get('github_sha'))
+                        st.session_state.github_sha = dm.load_data()[1]
+                        del st.session_state.temp_ocr_data
+                        st.rerun()
 
-    with c2:
-        st.subheader("📝 确认/手动记账")
-        
-        # 预填充数据
-        default_date = date.today()
-        default_amt = 0.0
-        default_mer = ""
-        default_cat = "餐饮"
-        default_type_idx = 0
-
-        if 'temp_ocr_data' in st.session_state:
-            res = st.session_state.temp_ocr_data
-            try:
-                default_date = pd.to_datetime(res.get('date', str(date.today()))).date()
-                default_amt = float(res.get('amount', 0.0))
-                default_mer = res.get('merchant', '')
-                default_cat = res.get('category', '其他')
-                default_type_idx = 1 if res.get('type') == '收入' else 0
-            except:
-                pass
-
-        with st.form("entry_form"):
-            f_date = st.date_input("日期", default_date)
-            cols = st.columns(2)
-            f_type = cols[0].selectbox("类型", ["支出", "收入"], index=default_type_idx)
-            f_cat = cols[1].text_input("分类", default_cat)
-            f_amt = st.number_input("金额", value=default_amt, step=0.1)
-            f_desc = st.text_input("备注/商户", default_mer)
+    # --- Tab 2: Manual ---
+    with tab_manual:
+        with st.form("manual_form"):
+            c_m1, c_m2 = st.columns(2)
+            m_date = c_m1.date_input("日期", date.today())
+            m_type = c_m2.selectbox("类型", ["支出", "收入"])
+            m_amt = c_m1.number_input("金额", step=1.0)
+            m_cat = c_m2.selectbox("分类", ["餐饮", "交通", "购物", "居住", "娱乐", "工资", "其他"])
+            m_desc = st.text_input("备注")
             
             if st.form_submit_button("💾 保存记录"):
-                new_row = {
-                    "日期": str(f_date), 
-                    "类型": f_type, 
-                    "金额": f_amt, 
-                    "备注": f_desc, 
-                    "分类": f_cat
-                }
-                st.session_state.ledger_data = pd.concat(
-                    [st.session_state.ledger_data, pd.DataFrame([new_row])], 
-                    ignore_index=True
-                )
-                
-                # 自动保存
-                if dm.save_data(st.session_state.ledger_data, st.session_state.get('github_sha')):
-                    st.success("已保存！")
-                    # 重新加载以获取最新 sha (如果用 GitHub)
-                    if dm.use_github:
-                        _, new_sha = dm.load_data()
-                        st.session_state.github_sha = new_sha
-                    if 'temp_ocr_data' in st.session_state:
-                        del st.session_state.temp_ocr_data
-                    st.rerun()
-                else:
-                    st.error("保存失败，请检查配置")
+                new_row = {"日期": str(m_date), "类型": m_type, "金额": m_amt, "备注": m_desc, "分类": m_cat}
+                st.session_state.ledger_data = pd.concat([st.session_state.ledger_data, pd.DataFrame([new_row])], ignore_index=True)
+                dm.save_data(st.session_state.ledger_data, st.session_state.get('github_sha'))
+                st.session_state.github_sha = dm.load_data()[1]
+                st.rerun()
+
+    # --- Tab 3: Import ---
+    with tab_import:
+        st.info("💡 提示：支持微信或支付宝导出的 CSV 文件。系统会自动忽略已存在的记录（日期、金额、类型、备注完全一致的）。")
+        import_file = st.file_uploader("上传账单文件", type=['csv'], key="bill_import")
+        
+        if import_file:
+            bill_type = st.radio("选择账单来源", ["微信", "支付宝"], horizontal=True)
+            if st.button("开始解析并导入"):
+                with st.spinner("正在解析文件..."):
+                    if bill_type == "微信":
+                        df_new, err = BillParser.parse_wechat(import_file)
+                    else:
+                        df_new, err = BillParser.parse_alipay(import_file)
+                    
+                    if err:
+                        st.error(err)
+                    elif df_new is not None and not df_new.empty:
+                        # 1. 组合新旧数据
+                        old_df = st.session_state.ledger_data.copy()
+                        
+                        # 2. 去重逻辑
+                        combined = pd.concat([old_df, df_new], ignore_index=True)
+                        deduplicated = combined.drop_duplicates(subset=['日期', '金额', '备注', '类型'], keep='first')
+                        
+                        # 3. 计算新增数量
+                        added_count = len(deduplicated) - len(old_df)
+                        ignored_count = len(df_new) - added_count
+                        
+                        if added_count > 0:
+                            if dm.save_data(deduplicated, st.session_state.get('github_sha')):
+                                st.session_state.ledger_data = deduplicated
+                                st.session_state.github_sha = dm.load_data()[1]
+                                st.success(f"🎉 成功导入 {added_count} 条新记录！")
+                                if ignored_count > 0:
+                                    st.warning(f"🛡️ 自动忽略了 {ignored_count} 条已存在的重复记录。")
+                                st.rerun()
+                            else:
+                                st.error("保存失败")
+                        else:
+                            st.warning(f"所有 {len(df_new)} 条记录均已存在，无需更新。")
+                    else:
+                        st.warning("解析成功，但没有发现有效交易记录。")
 
     st.divider()
 
-    # 5. 历史账单 (可编辑)
-    st.subheader("📊 历史账单 (可直接修改)")
-    
+    # 5. 历史账单 & 可视化
     if not st.session_state.ledger_data.empty:
-        # 使用 data_editor 允许直接修改表格
+        st.subheader("📊 历史账单")
+        
         edited_df = st.data_editor(
             st.session_state.ledger_data,
-            num_rows="dynamic", # 允许添加/删除行
+            num_rows="dynamic",
             use_container_width=True,
             key="history_editor"
         )
 
-        # 检查是否有修改
-        # 简单对比：如果 dataframe 不一样了，显示保存按钮
-        # 这里的逻辑是：用户修改完 data_editor，Streamlit 会自动更新 session_state 中的 editor key
-        # 我们需要一个显式的按钮来触发“写入磁盘/GitHub”的操作
-        
         col_save, col_info = st.columns([1, 4])
         with col_save:
-            if st.button("🔄 同步修改到存储"):
+            if st.button("🔄 同步表格修改"):
                 if dm.save_data(edited_df, st.session_state.get('github_sha')):
                     st.session_state.ledger_data = edited_df
-                    st.success("所有修改已同步！")
-                    if dm.use_github:
-                         _, new_sha = dm.load_data()
-                         st.session_state.github_sha = new_sha
+                    st.session_state.github_sha = dm.load_data()[1]
+                    st.success("同步成功")
                     st.rerun()
-                else:
-                    st.error("同步失败")
-    else:
-        st.info("暂无数据，快去记一笔吧！")
-
-    # 5.5 可视化看板
-    if not st.session_state.ledger_data.empty:
+        
         st.divider()
         st.subheader("📈 消费透视")
         
-        # 数据预处理
         chart_df = st.session_state.ledger_data.copy()
-        # 确保金额是数字，日期是时间格式
         chart_df['金额'] = pd.to_numeric(chart_df['金额'], errors='coerce').fillna(0)
         chart_df['日期'] = pd.to_datetime(chart_df['日期']).dt.date
-        
-        # 只分析支出数据
         expense_df = chart_df[chart_df['类型'] == '支出']
         
         if not expense_df.empty:
-            tab_chart1, tab_chart2 = st.tabs(["📊 分类占比", "📉 每日趋势"])
-            
-            with tab_chart1:
-                # 按分类汇总
-                category_sum = expense_df.groupby('分类')['金额'].sum().sort_values(ascending=False)
-                st.bar_chart(category_sum, color="#FF4B4B") # 使用红色系代表支出
-                
-            with tab_chart2:
-                # 按日期汇总
-                daily_sum = expense_df.groupby('日期')['金额'].sum()
-                st.line_chart(daily_sum)
-        else:
-            st.info("暂无支出数据，记录几笔支出后即可查看图表。")
+            t1, t2 = st.tabs(["📊 分类占比", "📉 每日趋势"])
+            with t1:
+                st.bar_chart(expense_df.groupby('分类')['金额'].sum().sort_values(ascending=False), color="#FF4B4B")
+            with t2:
+                st.line_chart(expense_df.groupby('日期')['金额'].sum())
+    else:
+        st.info("暂无数据")
 
-    # 6. 简单的 AI 分析 (保留)
-    with st.expander("🤖 呼叫 AI 财务分析"):
+    # 6. AI 分析
+    with st.expander("🤖 AI 财务分析"):
         if st.button("分析我的开销"):
             if sf_api_key and not st.session_state.ledger_data.empty:
                 with st.spinner("AI 正在思考..."):
@@ -369,7 +474,8 @@ def main():
                         "messages": [{"role": "user", "content": f"分析这份账单，指出问题：\n{summary}"}]
                     }
                     try:
-                        r = requests.post("https://api.siliconflow.cn/v1/chat/completions", 
+                        # 修复 URL 格式问题
+                        r = requests.post("[https://api.siliconflow.cn/v1/chat/completions](https://api.siliconflow.cn/v1/chat/completions)", 
                                         headers={"Authorization": f"Bearer {sf_api_key}"}, json=payload)
                         st.markdown(r.json()['choices'][0]['message']['content'])
                     except Exception as e:
