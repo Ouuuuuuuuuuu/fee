@@ -174,9 +174,6 @@ class BillParser:
     def _call_ai_parser(content_text, source_type, api_key):
         """调用 DeepSeek 进行结构化提取 (OpenAI SDK版)"""
         
-        # 移除截断逻辑，完整发送
-        # truncated_content = content_text[:50000] 
-        
         system_prompt = """
         你是一个专业的财务数据提取助手。你的任务是从杂乱的账单文本中提取交易流水。
         请遵循以下规则：
@@ -217,48 +214,63 @@ class BillParser:
             
             ai_content = response.choices[0].message.content
             
-            # --- 鲁棒性增强: 使用正则精确提取 JSON 数组 ---
-            # 目的：忽略掉 AI 可能输出的解释性前缀或后缀 (如 "Here is the json: ...")
+            # --- 强力 JSON 提取与修复逻辑 ---
+            # 清洗 Markdown 标记
+            clean_content = ai_content.replace("```json", "").replace("```", "").strip()
+            
+            data_list = []
             try:
-                # 寻找最外层的 [...]
-                match = re.search(r'\[.*\]', ai_content, re.DOTALL)
-                if match:
-                    json_str = match.group(0)
-                else:
-                    # 如果正则匹配失败，尝试基本的清洗回退
-                    json_str = ai_content.replace("```json", "").replace("```", "").strip()
-                
-                data_list = json.loads(json_str)
-                
-                if not isinstance(data_list, list):
-                    return None, "AI 返回格式错误（非数组）"
-                
-                if not data_list:
-                    return None, "AI 未能提取到任何有效交易记录"
-
-                df = pd.DataFrame(data_list)
-                
-                required_cols = ["date", "type", "amount", "merchant", "category"]
-                for col in required_cols:
-                    if col not in df.columns:
-                        df[col] = ""
-                
-                df = df.rename(columns={
-                    "date": "日期",
-                    "type": "类型",
-                    "amount": "金额",
-                    "merchant": "备注",
-                    "category": "分类"
-                })
-                
-                df['金额'] = pd.to_numeric(df['金额'], errors='coerce').fillna(0)
-                df['分类'] = df['分类'].fillna("AI导入")
-                
-                return df, None
-                
+                # 尝试直接解析
+                data_list = json.loads(clean_content)
             except json.JSONDecodeError:
-                # 如果正则提取后仍然解析失败，打印部分内容以便调试
-                return None, f"JSON 解析失败。AI 原始内容片段: {ai_content[:200]}..."
+                # 如果失败，尝试提取最外层的 [...]
+                start = clean_content.find('[')
+                end = clean_content.rfind(']')
+                
+                if start != -1 and end != -1 and end > start:
+                    json_str = clean_content[start:end+1]
+                    try:
+                        data_list = json.loads(json_str)
+                    except json.JSONDecodeError:
+                        # 如果仍然失败，可能是输出被截断（缺少结尾的 ']'）
+                        # 尝试找到最后一个 '}'，然后强制闭合数组
+                        last_obj_end = json_str.rfind('}')
+                        if last_obj_end != -1:
+                            fixed_json_str = json_str[:last_obj_end+1] + ']'
+                            try:
+                                data_list = json.loads(fixed_json_str)
+                            except:
+                                return None, f"JSON 修复失败。AI 响应片段: {clean_content[:500]}..."
+                        else:
+                             return None, f"无法提取有效 JSON。AI 响应片段: {clean_content[:500]}..."
+                else:
+                    return None, f"未找到 JSON 数组结构。AI 响应片段: {clean_content[:500]}..."
+
+            if not isinstance(data_list, list):
+                return None, "AI 返回格式错误（非数组）"
+            
+            if not data_list:
+                return None, "AI 未能提取到任何有效交易记录"
+
+            df = pd.DataFrame(data_list)
+            
+            required_cols = ["date", "type", "amount", "merchant", "category"]
+            for col in required_cols:
+                if col not in df.columns:
+                    df[col] = ""
+            
+            df = df.rename(columns={
+                "date": "日期",
+                "type": "类型",
+                "amount": "金额",
+                "merchant": "备注",
+                "category": "分类"
+            })
+            
+            df['金额'] = pd.to_numeric(df['金额'], errors='coerce').fillna(0)
+            df['分类'] = df['分类'].fillna("AI导入")
+            
+            return df, None
         
         except APITimeoutError:
             return None, "AI 请求超时。建议检查网络或分批上传文件。"
@@ -343,14 +355,15 @@ def process_bill_image(image_file, api_key):
         )
         
         content = response.choices[0].message.content
-        # 同样增强图片 OCR 的鲁棒性
-        match = re.search(r'\{.*\}', content, re.DOTALL)
-        if match:
-            json_str = match.group(0)
-        else:
-            json_str = content.replace("```json", "").replace("```", "").strip()
+        
+        # 鲁棒性提取
+        clean_content = content.replace("```json", "").replace("```", "").strip()
+        start = clean_content.find('{')
+        end = clean_content.rfind('}')
+        if start != -1 and end != -1:
+            clean_content = clean_content[start:end+1]
             
-        return json.loads(json_str), None
+        return json.loads(clean_content), None
 
     except Exception as e:
         return None, f"请求异常: {str(e)}"
