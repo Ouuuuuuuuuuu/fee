@@ -7,7 +7,7 @@ import json
 import base64
 from io import StringIO, BytesIO
 import os
-import pdfplumber
+import fitz  # PyMuPDF
 import re
 from openai import OpenAI, APITimeoutError
 import concurrent.futures
@@ -112,9 +112,8 @@ class BillParser:
         content_text = ""
         source_type = "未知文件"
         
-        # 并发模式下，status_container 可能为 None，避免线程冲突
         if status_container:
-            status_container.write(f"正在提取文本: {filename}...")
+            status_container.write(f"正在读取文件: {filename}...")
 
         try:
             # 1. 提取文件内容为纯文本
@@ -141,18 +140,12 @@ class BillParser:
             elif filename.endswith('.pdf'):
                 source_type = "PDF账单"
                 try:
-                    text_parts = []
-                    with pdfplumber.open(file) as pdf:
-                        for page in pdf.pages:
-                            tables = page.extract_tables()
-                            if tables:
-                                for table in tables:
-                                    df_table = pd.DataFrame(table)
-                                    df_table = df_table.fillna("")
-                                    text_parts.append(df_table.to_csv(index=False, header=False))
-                            else:
-                                text_parts.append(page.extract_text() or "")
-                    content_text = "\n".join(text_parts)
+                    # 使用 PyMuPDF (fitz) 进行高速读取
+                    with fitz.open(stream=file.read(), filetype="pdf") as doc:
+                        text_parts = []
+                        for page in doc:
+                            text_parts.append(page.get_text())
+                        content_text = "\n".join(text_parts)
                 except Exception as e:
                     return None, f"PDF 读取失败: {e}"
             else:
@@ -215,15 +208,12 @@ class BillParser:
             ai_content = response.choices[0].message.content
             
             # --- 强力 JSON 提取与修复逻辑 ---
-            # 清洗 Markdown 标记
             clean_content = ai_content.replace("```json", "").replace("```", "").strip()
             
             data_list = []
             try:
-                # 尝试直接解析
                 data_list = json.loads(clean_content)
             except json.JSONDecodeError:
-                # 如果失败，尝试提取最外层的 [...]
                 start = clean_content.find('[')
                 end = clean_content.rfind(']')
                 
@@ -232,8 +222,6 @@ class BillParser:
                     try:
                         data_list = json.loads(json_str)
                     except json.JSONDecodeError:
-                        # 如果仍然失败，可能是输出被截断（缺少结尾的 ']'）
-                        # 尝试找到最后一个 '}'，然后强制闭合数组
                         last_obj_end = json_str.rfind('}')
                         if last_obj_end != -1:
                             fixed_json_str = json_str[:last_obj_end+1] + ']'
@@ -458,8 +446,8 @@ def main():
                             with st.status("正在并发分析所有文件...", expanded=True) as status:
                                 batch_df = pd.DataFrame()
                                 
-                                # 使用线程池并发请求
-                                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                                # 优化：增加线程数到 10
+                                with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
                                     # 提交任务
                                     future_to_file = {
                                         executor.submit(BillParser.identify_and_parse, f, sf_api_key, None): f 
