@@ -439,10 +439,6 @@ def main():
         if files and st.button("🚀 开始识别", type="primary"):
             if not api_key: st.error("请配置 API Key"); st.stop()
             
-            # ... (保持原有的多线程处理逻辑不变，这里简化显示) ...
-            # 这里的 identify_and_parse 内部已经调用了 auto_categorize 逻辑（通过 prompt 或者 后处理）
-            # 为了保险，我们在 merge_data 时再次应用 auto_categorize
-            
             new_df = pd.DataFrame()
             # 模拟处理过程 (复用之前的逻辑)
             tasks_doc, tasks_img = [], []
@@ -545,7 +541,8 @@ def main():
                 
                 fig_area = px.area(daily_net, x='dt', y='asset', line_shape='spline')
                 fig_area.update_layout(xaxis_title="", yaxis_title="净资产", showlegend=False)
-                fig_area.update_traces(line_color="#2E86C1", fill_color="rgba(46, 134, 193, 0.2)")
+                # 修复后的代码：使用 fillcolor 而不是 fill_color
+                fig_area.update_traces(line_color="#2E86C1", fillcolor="rgba(46, 134, 193, 0.2)")
                 st.plotly_chart(fig_area, use_container_width=True)
 
 if __name__ == "__main__":
