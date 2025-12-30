@@ -5,7 +5,7 @@ from datetime import date
 import requests
 import json
 import base64
-from io import StringIO
+from io import StringIO, BytesIO
 import os
 import fitz  # PyMuPDF
 import re
@@ -181,43 +181,56 @@ class DataManager:
 # --- 智能账单解析类 ---
 class BillParser:
     @staticmethod
-    def identify_and_parse(file, api_key):
-        """处理单个文件，返回 (DataFrame, ErrorMsg, DebugInfo)"""
+    def identify_and_parse(filename, file_bytes, api_key):
+        """
+        处理单个文件内容
+        注意：这里不再接收 Streamlit 的 UploadedFile 对象，而是接收 (filename, file_bytes)
+        从而彻底解决 'missing ScriptRunContext' 问题
+        """
         t_start = time.time()
         debug_info = {}
         
         if not api_key:
             return None, "未配置 API Key", {}
 
-        filename = file.name.lower()
+        filename = filename.lower()
         content_text = ""
         source_type = "未知文件"
         
         try:
-            # 1. 提取文本
+            # 1. 提取文本 (基于 file_bytes)
             t_read_start = time.time()
+            
+            # 使用 BytesIO 包装二进制数据，使其像文件一样可读
+            file_stream = BytesIO(file_bytes)
+            
             if filename.endswith('.csv'):
                 source_type = "CSV账单"
                 try:
-                    content_text = file.getvalue().decode('utf-8')
+                    content_text = file_bytes.decode('utf-8')
                 except UnicodeDecodeError:
-                    file.seek(0)
-                    content_text = file.getvalue().decode('gbk', errors='ignore')
+                    content_text = file_bytes.decode('gbk', errors='ignore')
             
             elif filename.endswith(('.xls', '.xlsx')):
                 source_type = "Excel账单"
-                xls = pd.read_excel(file, sheet_name=None)
-                text_parts = []
-                for sheet_name, df in xls.items():
-                    text_parts.append(f"--- Sheet: {sheet_name} ---\n")
-                    text_parts.append(df.to_csv(index=False))
-                content_text = "\n".join(text_parts)
+                try:
+                    xls = pd.read_excel(file_stream, sheet_name=None)
+                    text_parts = []
+                    for sheet_name, df in xls.items():
+                        text_parts.append(f"--- Sheet: {sheet_name} ---\n")
+                        text_parts.append(df.to_csv(index=False))
+                    content_text = "\n".join(text_parts)
+                except Exception as e:
+                    return None, f"Excel 读取失败: {e}", debug_info
 
             elif filename.endswith('.pdf'):
                 source_type = "PDF账单"
-                with fitz.open(stream=file.read(), filetype="pdf") as doc:
-                    text_parts = [page.get_text() for page in doc]
-                    content_text = "\n".join(text_parts)
+                try:
+                    with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+                        text_parts = [page.get_text() for page in doc]
+                        content_text = "\n".join(text_parts)
+                except Exception as e:
+                    return None, f"PDF 读取失败: {e}", debug_info
             else:
                 return None, "不支持的文件格式", {}
 
@@ -339,14 +352,17 @@ class BillParser:
         return final_df, len(to_add), skipped_count
 
 # --- 图像处理 ---
-def process_bill_image(image_file, api_key):
+def process_bill_image(filename, image_bytes, api_key):
+    """
+    处理单个图片
+    同样不再接收 UploadedFile，而是接收 (filename, image_bytes)
+    """
     if not api_key: return None, "未配置 API Key", {}
     
     t_start = time.time()
     debug_info = {}
     
     try:
-        image_bytes = image_file.getvalue()
         base64_image = base64.b64encode(image_bytes).decode('utf-8')
         
         client = get_llm_client(api_key)
@@ -466,39 +482,66 @@ def main():
                 if doc_files:
                     st.caption(f"📄 正在并发分析 {len(doc_files)} 个文档...")
                     progress_bar = st.progress(0)
+                    
+                    # 关键修改：在主线程读取文件内容，只传递纯数据给子线程
+                    # 这彻底解决了 ThreadPoolExecutor 中的 Streamlit 上下文丢失问题
+                    doc_tasks = []
+                    for f in doc_files:
+                        doc_tasks.append({
+                            "file_obj": f,             # 仅用于UI显示名字
+                            "filename": f.name,        # 纯字符串
+                            "bytes": f.getvalue()      # 纯二进制数据
+                        })
+
                     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                        future_map = {executor.submit(BillParser.identify_and_parse, f, sf_api_key): f for f in doc_files}
+                        # 提交任务时，只传 name 和 bytes
+                        future_map = {
+                            executor.submit(BillParser.identify_and_parse, task["filename"], task["bytes"], sf_api_key): task["file_obj"] 
+                            for task in doc_tasks
+                        }
+                        
                         for i, future in enumerate(concurrent.futures.as_completed(future_map)):
-                            f = future_map[future]
+                            f_obj = future_map[future]
                             # 获取 debug_info
                             res, err, dbg = future.result()
                             
                             if st.session_state.debug_mode:
-                                with st.expander(f"🔧 调试: {f.name}", expanded=False):
+                                with st.expander(f"🔧 调试: {f_obj.name}", expanded=True): # 展开方便查看
                                     st.json(dbg)
-                                    if dbg.get('text_length', 0) > 100000:
-                                        st.warning("⚠️ 警告: 文本极长 (>10w字符)，AI 处理耗时会显著增加")
                             
                             if res is not None and not res.empty:
                                 batch_new_data = pd.concat([batch_new_data, res], ignore_index=True)
-                                st.toast(f"✅ {f.name} 解析成功")
+                                st.toast(f"✅ {f_obj.name} 解析成功")
                             else:
-                                st.error(f"❌ {f.name}: {err}")
+                                st.error(f"❌ {f_obj.name}: {err}")
                             progress_bar.progress((i + 1) / len(doc_files))
 
                 # B. 处理图片 - 并行化
                 if img_files:
                     st.caption(f"🖼️ 正在并发识别 {len(img_files)} 张图片...")
                     img_progress = st.progress(0)
+                    
+                    # 关键修改：图片也一样，主线程读取
+                    img_tasks = []
+                    for img in img_files:
+                        img_tasks.append({
+                            "file_obj": img,
+                            "filename": img.name,
+                            "bytes": img.getvalue()
+                        })
+
                     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-                        future_map = {executor.submit(process_bill_image, img, sf_api_key): img for img in img_files}
+                        future_map = {
+                            executor.submit(process_bill_image, task["filename"], task["bytes"], sf_api_key): task["file_obj"]
+                            for task in img_tasks
+                        }
                         
                         for i, future in enumerate(concurrent.futures.as_completed(future_map)):
-                            img = future_map[future]
+                            img_obj = future_map[future]
                             res, err, dbg = future.result()
                             
                             if st.session_state.debug_mode:
-                                with st.expander(f"🔧 调试: {img.name}", expanded=False):
+                                with st.expander(f"🔧 调试: {img_obj.name}", expanded=True):
                                     st.json(dbg)
 
                             if res:
@@ -510,9 +553,9 @@ def main():
                                     "备注": res.get('merchant', '图片识别')
                                 }
                                 batch_new_data = pd.concat([batch_new_data, pd.DataFrame([row])], ignore_index=True)
-                                st.toast(f"✅ {img.name} 识别成功")
+                                st.toast(f"✅ {img_obj.name} 识别成功")
                             else:
-                                st.error(f"❌ {img.name}: {err}")
+                                st.error(f"❌ {img_obj.name}: {err}")
                             img_progress.progress((i + 1) / len(img_files))
 
                 # C. 合并入库
