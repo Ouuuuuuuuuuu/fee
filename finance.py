@@ -560,7 +560,7 @@ def main():
                     st.json(debug_logs)
 
             if not new_df.empty:
-                merged_df, added = DataManager.merge_data(st.session_state.ledger_data, new_df)
+                merged_df, added = BillParser.merge_data(st.session_state.ledger_data, new_df)
                 if added > 0:
                     with st.spinner("正在保存至云端..."):
                         ok, new_sha = dm.save_data(merged_df, st.session_state.get('github_sha'))
@@ -584,7 +584,7 @@ def main():
             rem = c5.text_input("备注")
             if st.form_submit_button("💾 保存", width="stretch"):
                 row = pd.DataFrame([{"日期": str(d), "类型": t, "金额": a, "分类": cat, "备注": rem}])
-                merged, added = DataManager.merge_data(st.session_state.ledger_data, row)
+                merged, added = BillParser.merge_data(st.session_state.ledger_data, row)
                 ok, new_sha = dm.save_data(merged, st.session_state.get('github_sha'))
                 if ok:
                     st.session_state.ledger_data = merged
