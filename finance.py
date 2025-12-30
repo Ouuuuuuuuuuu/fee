@@ -96,39 +96,51 @@ class DataManager:
         df.to_csv(self.filename, index=False)
         return True
 
-    def _load_from_github(self):
+    # --- 优化：添加缓存，避免每次刷新页面都请求 GitHub，缓存 5 分钟 ---
+    @st.cache_data(ttl=300, show_spinner=False)
+    def _fetch_github_content(_self):
+        """内部函数：实际执行网络请求，单独拆分以支持缓存"""
         headers = {
-            "Authorization": f"token {self.github_token}",
+            "Authorization": f"token {_self.github_token}",
             "Accept": "application/vnd.github.v3+json"
         }
-        url = f"{GITHUB_API_URL}/repos/{self.repo}/contents/{self.filename}"
-        
+        url = f"{GITHUB_API_URL}/repos/{_self.repo}/contents/{_self.filename}"
         try:
-            # 增加 timeout 到 60秒，防止网络波动截断
+            # timeout 保持 60s
             response = requests.get(url, headers=headers, timeout=60)
             if response.status_code == 200:
-                content = response.json()
-                csv_str = base64.b64decode(content['content']).decode('utf-8')
-                try:
-                    df = pd.read_csv(StringIO(csv_str))
-                    # 确保包含必要列
-                    expected_df = self._create_empty_df()
-                    for col in expected_df.columns:
-                        if col not in df.columns:
-                            df[col] = ""
-                    return df, content['sha']
-                except pd.errors.EmptyDataError:
-                    return self._create_empty_df(), content['sha']
+                return response.json(), None
             elif response.status_code == 404:
-                return self._create_empty_df(), None
+                return None, 404
             else:
-                st.error(f"GitHub 读取错误: {response.status_code} - {response.text}")
-                return self._create_empty_df(), None
+                return None, response.status_code
         except Exception as e:
-            st.error(f"网络连接异常: {e}")
+            return None, str(e)
+
+    def _load_from_github(self):
+        # 调用带缓存的读取函数
+        content, error = self._fetch_github_content()
+        
+        if content:
+            csv_str = base64.b64decode(content['content']).decode('utf-8')
+            try:
+                df = pd.read_csv(StringIO(csv_str))
+                expected_df = self._create_empty_df()
+                for col in expected_df.columns:
+                    if col not in df.columns:
+                        df[col] = ""
+                return df, content['sha']
+            except pd.errors.EmptyDataError:
+                return self._create_empty_df(), content['sha']
+        elif error == 404:
+            return self._create_empty_df(), None
+        else:
+            if error:
+                st.error(f"GitHub 读取错误: {error}")
             return self._create_empty_df(), None
 
     def _save_to_github(self, df, sha):
+        start_time = time.time()
         headers = {
             "Authorization": f"token {self.github_token}",
             "Accept": "application/vnd.github.v3+json"
@@ -147,7 +159,13 @@ class DataManager:
         try:
             # 增加 timeout 到 60秒
             response = requests.put(url, headers=headers, data=json.dumps(data), timeout=60)
+            end_time = time.time()
+            if st.session_state.get('debug_mode'):
+                st.toast(f"☁️ GitHub 保存耗时: {end_time - start_time:.2f}s")
+            
             if response.status_code in [200, 201]:
+                # --- 优化：保存成功后清除读取缓存，确保下次读取是新的 ---
+                self._fetch_github_content.clear()
                 return True
             else:
                 st.error(f"GitHub 保存失败: {response.status_code} - {response.text}")
@@ -164,9 +182,12 @@ class DataManager:
 class BillParser:
     @staticmethod
     def identify_and_parse(file, api_key):
-        """处理单个文件，返回 (DataFrame, ErrorMsg)"""
+        """处理单个文件，返回 (DataFrame, ErrorMsg, DebugInfo)"""
+        t_start = time.time()
+        debug_info = {}
+        
         if not api_key:
-            return None, "未配置 API Key"
+            return None, "未配置 API Key", {}
 
         filename = file.name.lower()
         content_text = ""
@@ -174,6 +195,7 @@ class BillParser:
         
         try:
             # 1. 提取文本
+            t_read_start = time.time()
             if filename.endswith('.csv'):
                 source_type = "CSV账单"
                 try:
@@ -197,24 +219,30 @@ class BillParser:
                     text_parts = [page.get_text() for page in doc]
                     content_text = "\n".join(text_parts)
             else:
-                return None, "不支持的文件格式"
+                return None, "不支持的文件格式", {}
+
+            debug_info['read_time'] = time.time() - t_read_start
+            debug_info['text_length'] = len(content_text)
 
             if not content_text.strip():
-                return None, "无法提取文本内容"
+                return None, "无法提取文本内容", debug_info
             
-            # --- 修改：移除截断逻辑，宁缺毋假，保留全部内容供 AI 分析 ---
-            # if len(content_text) > 50000:
-            #     content_text = content_text[:25000] + "\n...[Middle Skipped]...\n" + content_text[-25000:]
-
             # 2. AI 解析
-            return BillParser._call_ai_parser(content_text, source_type, api_key)
+            res_df, err, ai_debug = BillParser._call_ai_parser(content_text, source_type, api_key)
+            debug_info.update(ai_debug)
+            
+            debug_info['total_time'] = time.time() - t_start
+            return res_df, err, debug_info
 
         except Exception as e:
-            return None, f"文件解析错误: {str(e)}"
+            return None, f"文件解析错误: {str(e)}", debug_info
 
     @staticmethod
     def _call_ai_parser(content_text, source_type, api_key):
-        # --- 修改：强化 Prompt，禁止捏造数据 ---
+        debug_info = {}
+        t_ai_start = time.time()
+        
+        # 强化 Prompt
         system_prompt = """
         你是一个严谨的财务数据提取专家。请从文本中提取交易流水。
         核心原则：宁缺毋假。绝对禁止捏造、模拟或推测数据。只提取文本中明确存在的交易。
@@ -237,19 +265,21 @@ class BillParser:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                # --- 修改：大幅增加 max_tokens，移除 timeout 限制 ---
                 max_tokens=8192,
-                temperature=0.0  # 降低温度，尽可能精准
+                temperature=0.0
             )
+            debug_info['ai_latency'] = time.time() - t_ai_start
             
+            t_parse_start = time.time()
             ai_content = response.choices[0].message.content
             data_list = extract_json_from_text(ai_content)
+            debug_info['parse_time'] = time.time() - t_parse_start
 
             if data_list is None or not isinstance(data_list, list):
-                return None, f"AI 返回格式无法解析: {ai_content[:100]}..."
+                return None, f"AI 返回格式无法解析: {ai_content[:100]}...", debug_info
             
             if not data_list:
-                return None, "未提取到有效数据"
+                return None, "未提取到有效数据", debug_info
 
             df = pd.DataFrame(data_list)
             
@@ -265,26 +295,26 @@ class BillParser:
             # 数据清洗
             df['金额'] = pd.to_numeric(df['金额'], errors='coerce').fillna(0)
             df['分类'] = df['分类'].fillna("其他")
-            # 简单日期清洗，防止格式错误
+            # 简单日期清洗
             df['日期'] = df['日期'].apply(lambda x: str(x).split(' ')[0])
 
-            return df, None
+            return df, None, debug_info
 
         except Exception as e:
-            return None, f"AI 请求失败: {str(e)}"
+            return None, f"AI 请求失败: {str(e)}", debug_info
 
     @staticmethod
     def merge_and_deduplicate(old_df, new_df):
-        """合并并去重 (基于 日期+金额+类型+备注 的简单指纹)"""
+        """合并并去重"""
         if new_df is None or new_df.empty:
             return old_df, 0, 0
 
-        # 构造指纹列用于比对
+        # 构造指纹列
         def make_fingerprint(df):
             return df['日期'].astype(str) + "_" + \
                    df['金额'].astype(float).round(2).astype(str) + "_" + \
                    df['类型'] + "_" + \
-                   df['备注'].str.slice(0, 5) # 备注取前5个字，防止OCR误差
+                   df['备注'].str.slice(0, 5)
 
         if old_df.empty:
             return new_df, len(new_df), 0
@@ -310,7 +340,10 @@ class BillParser:
 
 # --- 图像处理 ---
 def process_bill_image(image_file, api_key):
-    if not api_key: return None, "未配置 API Key"
+    if not api_key: return None, "未配置 API Key", {}
+    
+    t_start = time.time()
+    debug_info = {}
     
     try:
         image_bytes = image_file.getvalue()
@@ -319,6 +352,7 @@ def process_bill_image(image_file, api_key):
         client = get_llm_client(api_key)
         prompt = "提取账单信息。返回JSON: {date: 'YYYY-MM-DD', amount: float, merchant: string, category: string, type: '支出'|'收入'}。"
 
+        t_ai_start = time.time()
         response = client.chat.completions.create(
             model=VISION_MODEL_NAME,
             messages=[{
@@ -328,23 +362,30 @@ def process_bill_image(image_file, api_key):
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
                 ]
             }],
-            # --- 修改：增加 max_tokens ---
             max_tokens=2048
         )
+        debug_info['ai_latency'] = time.time() - t_ai_start
+        
         content = response.choices[0].message.content
         data = extract_json_from_text(content)
         
-        if isinstance(data, list): data = data[0] # 如果返回了数组取第一个
-        if not data: return None, "无法识别图片内容"
+        debug_info['total_time'] = time.time() - t_start
         
-        return data, None
+        if isinstance(data, list): data = data[0]
+        if not data: return None, "无法识别图片内容", debug_info
+        
+        return data, None, debug_info
     except Exception as e:
-        return None, f"视觉识别错误: {e}"
+        return None, f"视觉识别错误: {e}", debug_info
 
 # --- 主程序 ---
 def main():
     # 1. 侧边栏配置
     st.sidebar.title("⚙️ 财务设置")
+    
+    # --- 调试模式开关 ---
+    st.session_state.debug_mode = st.sidebar.checkbox("🛠️ 开启性能调试模式", value=False)
+    
     sf_api_key = st.secrets.get("SILICONFLOW_API_KEY", "")
     if not sf_api_key:
         sf_api_key = st.sidebar.text_input("SiliconFlow API Key", type="password")
@@ -359,12 +400,12 @@ def main():
     else:
         st.sidebar.info("📂 使用本地存储 (刷新页面后数据可能丢失)")
 
-    # --- 修改：默认值调整 ---
-    payday = st.sidebar.number_input("📅 每月发薪日", 1, 31, 10) # 默认为 10
-    current_cash = st.sidebar.number_input("💳 当前资产余额", value=3000.0) # 默认为 3000.0
+    payday = st.sidebar.number_input("📅 每月发薪日", 1, 31, 10)
+    current_cash = st.sidebar.number_input("💳 当前资产余额", value=3000.0)
 
     # 2. 初始化 Session State
     if 'ledger_data' not in st.session_state:
+        # 这里只会在第一次加载时调用 load_data，或者缓存失效时
         with st.spinner("正在加载账本数据..."):
             df, sha = dm.load_data()
             st.session_state.ledger_data = df
@@ -374,18 +415,14 @@ def main():
     st.title("💰 AI 智能账本 Pro")
     
     today = date.today()
-    # 计算距离发薪日
     if today.day >= payday:
         target_date = date(today.year + (1 if today.month == 12 else 0), 1 if today.month == 12 else today.month + 1, payday)
     else:
         target_date = date(today.year, today.month, payday)
     days_left = (target_date - today).days
 
-    # 简单预算逻辑
-    # 获取当月已支出
     current_month_str = today.strftime("%Y-%m")
     df_current = st.session_state.ledger_data.copy()
-    # 确保日期列为 datetime 以便筛选
     if not df_current.empty:
         df_current['tmp_date'] = pd.to_datetime(df_current['日期'], errors='coerce')
         mask = (df_current['tmp_date'].dt.strftime('%Y-%m') == current_month_str) & (df_current['类型'] == '支出')
@@ -425,16 +462,23 @@ def main():
 
                 batch_new_data = pd.DataFrame()
                 
-                # A. 处理文档 (并发，但限制线程数防止 429)
+                # A. 处理文档 - 提高并发
                 if doc_files:
-                    st.caption("📄 正在分析文档...")
+                    st.caption(f"📄 正在并发分析 {len(doc_files)} 个文档...")
                     progress_bar = st.progress(0)
-                    # 降低并发数
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                         future_map = {executor.submit(BillParser.identify_and_parse, f, sf_api_key): f for f in doc_files}
                         for i, future in enumerate(concurrent.futures.as_completed(future_map)):
                             f = future_map[future]
-                            res, err = future.result()
+                            # 获取 debug_info
+                            res, err, dbg = future.result()
+                            
+                            if st.session_state.debug_mode:
+                                with st.expander(f"🔧 调试: {f.name}", expanded=False):
+                                    st.json(dbg)
+                                    if dbg.get('text_length', 0) > 100000:
+                                        st.warning("⚠️ 警告: 文本极长 (>10w字符)，AI 处理耗时会显著增加")
+                            
                             if res is not None and not res.empty:
                                 batch_new_data = pd.concat([batch_new_data, res], ignore_index=True)
                                 st.toast(f"✅ {f.name} 解析成功")
@@ -442,24 +486,34 @@ def main():
                                 st.error(f"❌ {f.name}: {err}")
                             progress_bar.progress((i + 1) / len(doc_files))
 
-                # B. 处理图片 (串行，因为 Vision 模型较慢且贵)
+                # B. 处理图片 - 并行化
                 if img_files:
-                    st.caption("🖼️ 正在识别图片...")
-                    for img in img_files:
-                        res, err = process_bill_image(img, sf_api_key)
-                        if res:
-                            # 转换为 DataFrame 格式
-                            row = {
-                                "日期": res.get('date', str(date.today())),
-                                "类型": res.get('type', '支出'),
-                                "金额": res.get('amount', 0),
-                                "分类": res.get('category', '其他'),
-                                "备注": res.get('merchant', '图片识别')
-                            }
-                            batch_new_data = pd.concat([batch_new_data, pd.DataFrame([row])], ignore_index=True)
-                            st.toast(f"✅ {img.name} 识别成功")
-                        else:
-                            st.error(f"❌ {img.name}: {err}")
+                    st.caption(f"🖼️ 正在并发识别 {len(img_files)} 张图片...")
+                    img_progress = st.progress(0)
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                        future_map = {executor.submit(process_bill_image, img, sf_api_key): img for img in img_files}
+                        
+                        for i, future in enumerate(concurrent.futures.as_completed(future_map)):
+                            img = future_map[future]
+                            res, err, dbg = future.result()
+                            
+                            if st.session_state.debug_mode:
+                                with st.expander(f"🔧 调试: {img.name}", expanded=False):
+                                    st.json(dbg)
+
+                            if res:
+                                row = {
+                                    "日期": res.get('date', str(date.today())),
+                                    "类型": res.get('type', '支出'),
+                                    "金额": res.get('amount', 0),
+                                    "分类": res.get('category', '其他'),
+                                    "备注": res.get('merchant', '图片识别')
+                                }
+                                batch_new_data = pd.concat([batch_new_data, pd.DataFrame([row])], ignore_index=True)
+                                st.toast(f"✅ {img.name} 识别成功")
+                            else:
+                                st.error(f"❌ {img.name}: {err}")
+                            img_progress.progress((i + 1) / len(img_files))
 
                 # C. 合并入库
                 if not batch_new_data.empty:
@@ -476,7 +530,6 @@ def main():
                     st.warning("未能提取到有效数据")
 
     with tab_manual:
-        # 使用 Form 避免每次输入刷新
         with st.form("add_transaction"):
             c1, c2, c3 = st.columns(3)
             new_date = c1.date_input("日期", value=date.today())
@@ -503,7 +556,6 @@ def main():
         if st.session_state.ledger_data.empty:
             st.info("暂无数据，请先记账。")
         else:
-            # 1. 可编辑表格 (功能更强)
             st.subheader("📝 账单明细")
             
             edited_df = st.data_editor(
@@ -519,11 +571,7 @@ def main():
                 key="data_editor"
             )
 
-            # 检测是否修改并保存
-            # 注意：st.data_editor 的返回值就是修改后的 df
-            # 我们添加一个按钮来触发保存，避免每次改单元格都请求 API
             if st.button("💾 保存表格修改"):
-                # 简单比较是否变化 (此处仅比较长度和某些值，生产环境可用 dataframe hash)
                 if not edited_df.equals(st.session_state.ledger_data):
                      if dm.save_data(edited_df, st.session_state.get('github_sha')):
                         st.session_state.ledger_data = edited_df
@@ -534,7 +582,6 @@ def main():
 
             st.divider()
             
-            # 2. 图表
             c_chart1, c_chart2 = st.columns(2)
             
             df_chart = st.session_state.ledger_data.copy()
@@ -561,7 +608,6 @@ def main():
                                         {"role": "system", "content": "你是一个严厉但幽默的理财顾问。根据用户的支出数据，简短点评其消费习惯，并给出3条省钱建议。"},
                                         {"role": "user", "content": f"我的支出数据:\n{summary_text}"}
                                     ],
-                                    # --- 修改：分析报告也使用更大的 Token 限制 ---
                                     max_tokens=4096
                                 )
                                 st.markdown(res.choices[0].message.content)
