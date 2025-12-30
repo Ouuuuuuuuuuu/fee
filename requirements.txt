@@ -6,3 +6,4 @@ xlrd
 pymupdf
 openai
 frontend
+plotly
