@@ -14,7 +14,7 @@ import concurrent.futures
 import time
 
 # --- 页面配置 ---
-st.set_page_config(page_title="AI 账本 ", page_icon="💰", layout="wide")
+st.set_page_config(page_title="AI 智能账本 Pro", page_icon="💰", layout="wide")
 
 # --- 常量配置 ---
 DEFAULT_TARGET_SPEND = 60.0  # 每日体面支出标准
@@ -22,8 +22,9 @@ GITHUB_API_URL = "https://api.github.com"
 VISION_MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct" 
 TEXT_MODEL_NAME = "deepseek-ai/DeepSeek-V3.2"
 
-# --- 缓存资源：获取 LLM 客户端 ---
-@st.cache_resource
+# --- 核心修复：移除 st.cache_resource ---
+# 原因：在多线程中调用被 st.cache 装饰的函数会导致 ScriptRunContext 丢失报错。
+# OpenAI 客户端初始化极快，不需要缓存。
 def get_llm_client(api_key):
     return OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1")
 
@@ -96,7 +97,7 @@ class DataManager:
         df.to_csv(self.filename, index=False)
         return True
 
-    # --- 优化：添加缓存，避免每次刷新页面都请求 GitHub，缓存 5 分钟 ---
+    # --- 优化：GitHub 读取保留缓存，因为它是主线程调用的 ---
     @st.cache_data(ttl=300, show_spinner=False)
     def _fetch_github_content(_self):
         """内部函数：实际执行网络请求，单独拆分以支持缓存"""
@@ -185,7 +186,6 @@ class BillParser:
         """
         处理单个文件内容
         注意：这里不再接收 Streamlit 的 UploadedFile 对象，而是接收 (filename, file_bytes)
-        从而彻底解决 'missing ScriptRunContext' 问题
         """
         t_start = time.time()
         debug_info = {}
@@ -270,7 +270,9 @@ class BillParser:
 
         user_prompt = f"请处理这份 {source_type}，当前年份默认为 {datetime.datetime.now().year}。\n数据内容如下:\n{content_text}"
 
+        # 直接调用，不依赖缓存
         client = get_llm_client(api_key)
+        
         try:
             response = client.chat.completions.create(
                 model=TEXT_MODEL_NAME,
@@ -355,7 +357,6 @@ class BillParser:
 def process_bill_image(filename, image_bytes, api_key):
     """
     处理单个图片
-    同样不再接收 UploadedFile，而是接收 (filename, image_bytes)
     """
     if not api_key: return None, "未配置 API Key", {}
     
@@ -365,6 +366,7 @@ def process_bill_image(filename, image_bytes, api_key):
     try:
         base64_image = base64.b64encode(image_bytes).decode('utf-8')
         
+        # 直接调用，不依赖缓存
         client = get_llm_client(api_key)
         prompt = "提取账单信息。返回JSON: {date: 'YYYY-MM-DD', amount: float, merchant: string, category: string, type: '支出'|'收入'}。"
 
@@ -400,7 +402,7 @@ def main():
     st.sidebar.title("⚙️ 财务设置")
     
     # --- 调试模式开关 ---
-    st.session_state.debug_mode = st.sidebar.checkbox("🛠️ 开启调试模式", value=False)
+    st.session_state.debug_mode = st.sidebar.checkbox("🛠️ 开启性能调试模式", value=False)
     
     sf_api_key = st.secrets.get("SILICONFLOW_API_KEY", "")
     if not sf_api_key:
@@ -484,13 +486,13 @@ def main():
                     progress_bar = st.progress(0)
                     
                     # 关键修改：在主线程读取文件内容，只传递纯数据给子线程
-                    # 这彻底解决了 ThreadPoolExecutor 中的 Streamlit 上下文丢失问题
                     doc_tasks = []
                     for f in doc_files:
+                        f.seek(0) # 安全起见
                         doc_tasks.append({
                             "file_obj": f,             # 仅用于UI显示名字
                             "filename": f.name,        # 纯字符串
-                            "bytes": f.getvalue()      # 纯二进制数据
+                            "bytes": f.read()          # 纯二进制数据，使用 read() 配合 seek(0)
                         })
 
                     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
@@ -502,18 +504,22 @@ def main():
                         
                         for i, future in enumerate(concurrent.futures.as_completed(future_map)):
                             f_obj = future_map[future]
-                            # 获取 debug_info
-                            res, err, dbg = future.result()
-                            
-                            if st.session_state.debug_mode:
-                                with st.expander(f"🔧 调试: {f_obj.name}", expanded=True): # 展开方便查看
-                                    st.json(dbg)
-                            
-                            if res is not None and not res.empty:
-                                batch_new_data = pd.concat([batch_new_data, res], ignore_index=True)
-                                st.toast(f"✅ {f_obj.name} 解析成功")
-                            else:
-                                st.error(f"❌ {f_obj.name}: {err}")
+                            try:
+                                # 获取 debug_info
+                                res, err, dbg = future.result()
+                                
+                                if st.session_state.debug_mode:
+                                    with st.expander(f"🔧 调试: {f_obj.name}", expanded=True): # 展开方便查看
+                                        st.json(dbg)
+                                
+                                if res is not None and not res.empty:
+                                    batch_new_data = pd.concat([batch_new_data, res], ignore_index=True)
+                                    st.toast(f"✅ {f_obj.name} 解析成功")
+                                else:
+                                    st.error(f"❌ {f_obj.name}: {err}")
+                            except Exception as e:
+                                st.error(f"❌ {f_obj.name} 线程崩溃: {e}")
+                                
                             progress_bar.progress((i + 1) / len(doc_files))
 
                 # B. 处理图片 - 并行化
@@ -524,10 +530,11 @@ def main():
                     # 关键修改：图片也一样，主线程读取
                     img_tasks = []
                     for img in img_files:
+                        img.seek(0)
                         img_tasks.append({
                             "file_obj": img,
                             "filename": img.name,
-                            "bytes": img.getvalue()
+                            "bytes": img.read()
                         })
 
                     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
@@ -538,24 +545,28 @@ def main():
                         
                         for i, future in enumerate(concurrent.futures.as_completed(future_map)):
                             img_obj = future_map[future]
-                            res, err, dbg = future.result()
-                            
-                            if st.session_state.debug_mode:
-                                with st.expander(f"🔧 调试: {img_obj.name}", expanded=True):
-                                    st.json(dbg)
+                            try:
+                                res, err, dbg = future.result()
+                                
+                                if st.session_state.debug_mode:
+                                    with st.expander(f"🔧 调试: {img_obj.name}", expanded=True):
+                                        st.json(dbg)
 
-                            if res:
-                                row = {
-                                    "日期": res.get('date', str(date.today())),
-                                    "类型": res.get('type', '支出'),
-                                    "金额": res.get('amount', 0),
-                                    "分类": res.get('category', '其他'),
-                                    "备注": res.get('merchant', '图片识别')
-                                }
-                                batch_new_data = pd.concat([batch_new_data, pd.DataFrame([row])], ignore_index=True)
-                                st.toast(f"✅ {img_obj.name} 识别成功")
-                            else:
-                                st.error(f"❌ {img_obj.name}: {err}")
+                                if res:
+                                    row = {
+                                        "日期": res.get('date', str(date.today())),
+                                        "类型": res.get('type', '支出'),
+                                        "金额": res.get('amount', 0),
+                                        "分类": res.get('category', '其他'),
+                                        "备注": res.get('merchant', '图片识别')
+                                    }
+                                    batch_new_data = pd.concat([batch_new_data, pd.DataFrame([row])], ignore_index=True)
+                                    st.toast(f"✅ {img_obj.name} 识别成功")
+                                else:
+                                    st.error(f"❌ {img_obj.name}: {err}")
+                            except Exception as e:
+                                st.error(f"❌ {img_obj.name} 线程崩溃: {e}")
+                                
                             img_progress.progress((i + 1) / len(img_files))
 
                 # C. 合并入库
