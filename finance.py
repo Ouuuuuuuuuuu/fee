@@ -9,7 +9,8 @@ from io import StringIO, BytesIO
 import os
 import pdfplumber
 import re
-from openai import OpenAI
+from openai import OpenAI, APITimeoutError
+import concurrent.futures
 
 # --- 页面配置 ---
 st.set_page_config(page_title="AI 智能账本", page_icon="💰", layout="wide")
@@ -18,7 +19,7 @@ st.set_page_config(page_title="AI 智能账本", page_icon="💰", layout="wide"
 DEFAULT_TARGET_SPEND = 60.0  # 每日体面支出标准
 GITHUB_API_URL = "https://api.github.com"
 VISION_MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct" 
-TEXT_MODEL_NAME = "deepseek-ai/DeepSeek-V3" # SiliconFlow 目前主力是 V3，V3.2 如果上线可直接替换
+TEXT_MODEL_NAME = "deepseek-ai/DeepSeek-V3" # SiliconFlow 目前主力是 V3
 
 # --- 辅助函数：获取 LLM 客户端 ---
 def get_llm_client(api_key):
@@ -102,7 +103,7 @@ class DataManager:
 # --- 智能账单解析类 (AI核心版) ---
 class BillParser:
     @staticmethod
-    def identify_and_parse(file, api_key):
+    def identify_and_parse(file, api_key, status_container=None):
         """智能识别文件类型并提取文本，交给AI解析"""
         if not api_key:
             return None, "请先配置 SILICONFLOW_API_KEY 以使用 AI 解析功能"
@@ -110,6 +111,10 @@ class BillParser:
         filename = file.name.lower()
         content_text = ""
         source_type = "未知文件"
+        
+        # 并发模式下，status_container 可能为 None，避免线程冲突
+        if status_container:
+            status_container.write(f"正在提取文本: {filename}...")
 
         try:
             # 1. 提取文件内容为纯文本
@@ -156,6 +161,9 @@ class BillParser:
             # 2. 调用 AI 进行解析
             if not content_text.strip():
                 return None, "文件内容为空或无法提取文本"
+            
+            if status_container:
+                status_container.write(f"文本提取完成 ({len(content_text)} 字符)，正在呼叫 DeepSeek 分析...")
                 
             return BillParser._call_ai_parser(content_text, source_type, api_key)
 
@@ -166,7 +174,8 @@ class BillParser:
     def _call_ai_parser(content_text, source_type, api_key):
         """调用 DeepSeek 进行结构化提取 (OpenAI SDK版)"""
         
-        truncated_content = content_text[:100000]
+        # 移除截断逻辑，完整发送
+        # truncated_content = content_text[:50000] 
         
         system_prompt = """
         你是一个专业的财务数据提取助手。你的任务是从杂乱的账单文本中提取交易流水。
@@ -188,12 +197,13 @@ class BillParser:
         请处理这份 {source_type} 数据，提取所有交易记录。
         
         数据内容片段：
-        {truncated_content}
+        {content_text}
         """
 
         client = get_llm_client(api_key)
 
         try:
+            # 移除 timeout 设置，允许模型长时间思考处理大文件
             response = client.chat.completions.create(
                 model=TEXT_MODEL_NAME,
                 messages=[
@@ -202,15 +212,24 @@ class BillParser:
                 ],
                 max_tokens=8192,
                 temperature=0.1
+                # timeout=None # 默认不设置即为无限制（或受限于网络层默认值）
             )
             
             ai_content = response.choices[0].message.content
             
-            # 清洗 Markdown
-            ai_content = ai_content.replace("```json", "").replace("```", "").strip()
-            
+            # --- 鲁棒性增强: 使用正则精确提取 JSON 数组 ---
+            # 目的：忽略掉 AI 可能输出的解释性前缀或后缀 (如 "Here is the json: ...")
             try:
-                data_list = json.loads(ai_content)
+                # 寻找最外层的 [...]
+                match = re.search(r'\[.*\]', ai_content, re.DOTALL)
+                if match:
+                    json_str = match.group(0)
+                else:
+                    # 如果正则匹配失败，尝试基本的清洗回退
+                    json_str = ai_content.replace("```json", "").replace("```", "").strip()
+                
+                data_list = json.loads(json_str)
+                
                 if not isinstance(data_list, list):
                     return None, "AI 返回格式错误（非数组）"
                 
@@ -238,8 +257,11 @@ class BillParser:
                 return df, None
                 
             except json.JSONDecodeError:
-                return None, f"AI 返回了非 JSON 数据: {ai_content[:100]}..."
-                
+                # 如果正则提取后仍然解析失败，打印部分内容以便调试
+                return None, f"JSON 解析失败。AI 原始内容片段: {ai_content[:200]}..."
+        
+        except APITimeoutError:
+            return None, "AI 请求超时。建议检查网络或分批上传文件。"
         except Exception as e:
             return None, f"AI 请求异常: {str(e)}"
 
@@ -321,8 +343,14 @@ def process_bill_image(image_file, api_key):
         )
         
         content = response.choices[0].message.content
-        clean_content = content.replace("```json", "").replace("```", "").strip()
-        return json.loads(clean_content), None
+        # 同样增强图片 OCR 的鲁棒性
+        match = re.search(r'\{.*\}', content, re.DOTALL)
+        if match:
+            json_str = match.group(0)
+        else:
+            json_str = content.replace("```json", "").replace("```", "").strip()
+            
+        return json.loads(json_str), None
 
     except Exception as e:
         return None, f"请求异常: {str(e)}"
@@ -403,7 +431,7 @@ def main():
 
             col_a, col_b = st.columns(2)
             
-            # --- 批量处理数据文件 (AI 文本解析) ---
+            # --- 批量处理数据文件 (并发 AI 解析) ---
             if data_files:
                 with col_a:
                     st.info(f"检测到 {len(data_files)} 个数据文件")
@@ -414,18 +442,33 @@ def main():
                             total_added = 0
                             total_skipped = 0
                             
-                            with st.spinner("正在提取文本并呼叫 DeepSeek 进行分析 (可能需要几十秒)..."):
+                            with st.status("正在并发分析所有文件...", expanded=True) as status:
                                 batch_df = pd.DataFrame()
                                 
-                                for f in data_files:
-                                    # 注意：这里需要传入 api_key
-                                    df_new, err = BillParser.identify_and_parse(f, sf_api_key)
-                                    if err:
-                                        st.error(f"文件 {f.name} 解析失败: {err}")
-                                    elif df_new is not None and not df_new.empty:
-                                        batch_df = pd.concat([batch_df, df_new], ignore_index=True)
-                                
+                                # 使用线程池并发请求
+                                with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                                    # 提交任务
+                                    future_to_file = {
+                                        executor.submit(BillParser.identify_and_parse, f, sf_api_key, None): f 
+                                        for f in data_files
+                                    }
+                                    
+                                    for future in concurrent.futures.as_completed(future_to_file):
+                                        f = future_to_file[future]
+                                        try:
+                                            df_new, err = future.result()
+                                            if err:
+                                                status.write(f"❌ {f.name}: {err}")
+                                            elif df_new is not None and not df_new.empty:
+                                                status.write(f"✅ {f.name}: 提取成功 ({len(df_new)} 条)")
+                                                batch_df = pd.concat([batch_df, df_new], ignore_index=True)
+                                            else:
+                                                status.write(f"⚠️ {f.name}: 未提取到数据")
+                                        except Exception as exc:
+                                            status.write(f"❌ {f.name}: 处理异常 {exc}")
+
                                 if not batch_df.empty:
+                                    status.write("正在合并数据并去重...")
                                     merged_df, added_count, skipped_count = BillParser.merge_and_deduplicate(
                                         st.session_state.ledger_data, batch_df
                                     )
@@ -436,15 +479,17 @@ def main():
                                         if dm.save_data(merged_df, st.session_state.get('github_sha')):
                                             st.session_state.ledger_data = merged_df
                                             st.session_state.github_sha = dm.load_data()[1]
-                                            st.success(f"🎉 成功！DeepSeek 帮你提取了 {total_added} 条新记录。")
-                                            if total_skipped > 0:
-                                                st.info(f"🛡️ 自动跳过了 {total_skipped} 条重复记录")
+                                            status.update(label="处理完成！", state="complete", expanded=False)
+                                            st.success(f"🎉 成功导入 {total_added} 条新记录！(自动跳过 {total_skipped} 条重复)")
                                             st.rerun()
                                         else:
+                                            status.update(label="保存失败", state="error")
                                             st.error("保存失败")
                                     else:
-                                        st.warning(f"分析完成，但所有记录均已存在 (跳过 {total_skipped} 条)。")
+                                        status.update(label="处理完成 - 无新增数据", state="complete")
+                                        st.warning(f"所有记录均已存在 (跳过 {total_skipped} 条)。")
                                 else:
+                                    status.update(label="处理完成 - 无有效数据", state="error")
                                     st.warning("AI 没有发现有效的交易数据，可能是文件内容为空或格式过于特殊。")
 
             # --- 批量/单张 图片处理 (OCR) ---
@@ -458,14 +503,18 @@ def main():
                         if not sf_api_key:
                             st.error("请配置 SILICONFLOW_API_KEY")
                         else:
-                            with st.spinner("AI 正在逐张读取..."):
+                            # 图片识别通常很快，暂不使用并发，以免 UI 过于复杂，且 Qwen-VL 并发限流可能更严
+                            with st.status("正在进行视觉识别...", expanded=True) as status:
                                 for img_f in img_files:
+                                    status.write(f"正在识别: {img_f.name}...")
                                     data, err = process_bill_image(img_f, sf_api_key)
                                     if not err and data:
                                         data['_filename'] = img_f.name
                                         st.session_state.ocr_queue.append(data)
+                                        status.write(f"✅ {img_f.name}: 识别成功")
                                     else:
-                                        st.error(f"{img_f.name} 识别失败: {err}")
+                                        status.write(f"❌ {img_f.name}: {err}")
+                                status.update(label="识别完成，请在下方确认", state="complete")
                             st.rerun()
 
         # --- OCR 结果确认队列 ---
@@ -562,7 +611,8 @@ def main():
                             model=TEXT_MODEL_NAME,
                             messages=[
                                 {"role": "user", "content": f"分析这份账单，指出问题：\n{summary}"}
-                            ]
+                            ],
+                            timeout=60
                         )
                         st.markdown(response.choices[0].message.content)
                     except Exception as e:
