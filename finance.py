@@ -15,13 +15,12 @@ import time
 import plotly.express as px
 
 # --- 页面配置 ---
-st.set_page_config(page_title="AI 智能账本 Pro (视觉增强版)", page_icon="💰", layout="wide")
+st.set_page_config(page_title="AI 智能账本 Pro (PDF视觉版)", page_icon="💰", layout="wide")
 
-# --- 常量配置 ---
+# --- 常量配置 (严格保留你的模型设置) ---
 GITHUB_API_URL = "https://api.github.com"
-# 推荐使用能力较强的视觉模型，如 Qwen2.5-VL 或 Qwen2-VL-72B
-VISION_MODEL_NAME = "Qwen/Qwen2.5-VL-72B-Instruct" 
-TEXT_MODEL_NAME = "deepseek-ai/DeepSeek-V3"
+VISION_MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct" 
+TEXT_MODEL_NAME = "deepseek-ai/DeepSeek-V3.2"
 CHUNK_SIZE = 12000 
 BILL_CYCLE_DAY = 10  # 账单日：每月10号
 
@@ -31,7 +30,6 @@ ALLOWED_CATEGORIES = [
 
 # --- 核心工具：OpenAI Client ---
 def get_llm_client(api_key):
-    # 请确保 base_url 符合你使用的服务商 (如 SiliconFlow, DeepSeek 等)
     return OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1")
 
 # --- 辅助逻辑 ---
@@ -72,7 +70,6 @@ def extract_json_from_text(text):
     if not text: return None, "空响应"
     try:
         text = text.strip()
-        # 尝试提取 Markdown 代码块
         code_block_pattern = r"``" + r"`(?:json)?(.*?)``" + r"`"
         match_code = re.search(code_block_pattern, text, re.DOTALL)
         if match_code: text = match_code.group(1).strip()
@@ -82,7 +79,6 @@ def extract_json_from_text(text):
             text = text.strip()
         
         text = repair_truncated_json(text)
-        # 提取数组部分
         match_array = re.search(r'\[.*\]', text, re.DOTALL)
         if match_array: text_to_parse = match_array.group()
         else: text_to_parse = text
@@ -95,7 +91,6 @@ def extract_json_from_text(text):
 
 # --- 基金相关工具 ---
 def get_fund_realtime_valuation(fund_code):
-    """通过公开接口获取基金估值"""
     url = f"http://fundgz.1234567.com.cn/js/{fund_code}.js?rt={int(time.time()*1000)}"
     try:
         resp = requests.get(url, timeout=3)
@@ -252,7 +247,7 @@ class DataManager:
             return pd.DataFrame(columns=["基金代码", "基金名称", "持有份额", "成本金额"])
         return pd.DataFrame()
 
-# --- AI 解析器 (支持 PDF 转图片视觉识别) ---
+# --- AI 解析器 (升级版：PDF走视觉识别) ---
 class BillParser:
     @staticmethod
     def chunk_text_by_lines(text, max_chars=CHUNK_SIZE):
@@ -321,7 +316,7 @@ class BillParser:
                 **任务目标**：提取明细表格中的所有交易。
                 
                 **关键规则**：
-                1. **忽略印章**：请忽略覆盖在文字上的红色印章（如“电子回单专用章”）。
+                1. **忽略印章**：请忽略覆盖在文字上的红色印章（如“电子回单专用章”），不要让它干扰文字识别。
                 2. **识别正负数**：
                    - 如果金额列显示为负数（如 -10.40），则 type 为 "支出"，amount 记为正数 10.40。
                    - 如果金额列显示为正数，则 type 为 "收入"。
@@ -348,7 +343,7 @@ class BillParser:
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
                     ]
                 }],
-                max_tokens=4096
+                max_tokens=2048
             )
             data, _ = extract_json_from_text(resp.choices[0].message.content)
             
@@ -384,7 +379,7 @@ class BillParser:
                 if not images: return None, "PDF转图片失败", {}
                 
                 all_pdf_df = pd.DataFrame()
-                # 循环处理每一页 PDF
+                # 循环处理每一页 PDF (串行或简单并发)
                 for i, img_bytes in enumerate(images):
                     res, err, _ = BillParser.process_image(f"{filename}_p{i}", img_bytes, api_key, mode="ledger")
                     if res is not None and not res.empty:
@@ -402,7 +397,6 @@ class BillParser:
                 xls = pd.read_excel(BytesIO(file_bytes), sheet_name=None)
                 content_text = "\n".join([f"{s}\n{d.to_csv(index=False)}" for s, d in xls.items()])
             else:
-                # 其他格式尝试直接走视觉（如不支持的图片格式漏网之鱼）
                 return None, "不支持的文件格式", {}
             
             if not content_text.strip(): return None, "空文件", {}
@@ -466,7 +460,7 @@ def main():
         st.session_state.fund_data = df
         st.session_state.fund_sha = sha
 
-    st.title("💰 AI 智能账本 Pro (视觉增强版)")
+    st.title("💰 AI 智能账本 Pro (PDF视觉版)")
     
     default_start, default_end = get_fiscal_range(date.today())
     col_d1, col_d2 = st.columns([2, 1])
@@ -523,19 +517,13 @@ def main():
     t_import, t_add, t_history, t_funds, t_stats = st.tabs(["📥 账单导入", "✍️ 手动记账", "📋 历史明细", "📈 基金持仓", "📊 报表"])
 
     with t_import:
-        st.info("💡 升级提示：现已支持 PDF 银行账单的视觉识别！自动忽略红章、自动处理负数支出。")
+        st.info("💡 升级：PDF 账单现在使用 Qwen3-VL 视觉模型进行识别，可自动忽略红章干扰。")
         files = st.file_uploader("上传账单 (PDF/图片/CSV/Excel)", accept_multiple_files=True)
         if files and st.button("🚀 开始识别账单", type="primary"):
             if not api_key: st.error("请配置 API Key"); st.stop()
             
             new_df = pd.DataFrame()
-            tasks = []
             
-            # 预处理：区分图片/PDF (走视觉) 和 CSV/Excel (走文本)
-            # 注意：BillParser.identify_and_parse 内部已经处理了 PDF->图片 的逻辑
-            # 我们只需要根据文件后缀传参即可
-            
-            # 这里为了简化进度条，我们还是把每个文件作为一个任务
             with st.status("正在AI识别...") as status:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
                     futures = {}
@@ -543,12 +531,12 @@ def main():
                         f.seek(0)
                         file_bytes = f.read()
                         
-                        # 如果是图片，直接调 visual 处理 (为了复用逻辑，identify_and_parse 也可以处理，但这里我们显式区分一下更清晰)
                         ext = f.name.split('.')[-1].lower()
+                        # 图片直接走 visual (mode=ledger)
                         if ext in ['png', 'jpg', 'jpeg']:
                              futures[executor.submit(BillParser.process_image, f.name, file_bytes, api_key, "ledger")] = f.name
                         else:
-                             # PDF, Excel, CSV 都交给 identify_and_parse 智能判断
+                             # PDF (会转图) 或 Excel/CSV (纯文本)
                              futures[executor.submit(BillParser.identify_and_parse, f.name, file_bytes, api_key)] = f.name
                     
                     for future in concurrent.futures.as_completed(futures):
@@ -621,6 +609,7 @@ def main():
                 with st.status("识别中...") as status:
                     for f in fund_files:
                         f.seek(0)
+                        # 使用 Qwen3-VL (复用 process_image)
                         res, err, _ = BillParser.process_image(f.name, f.read(), api_key, mode="fund")
                         if res is not None: new_funds = pd.concat([new_funds, res], ignore_index=True)
                     status.update(label="完成", state="complete")
